@@ -608,6 +608,13 @@ jobs:
             ${{ matrix.wire_zstd }} &
           sleep 1
 
+          # CPU saturation check: is the shared CI runner itself the ceiling,
+          # regardless of anything on the mvSQLite side? Sample per-core and
+          # overall utilization throughout the actual benchmark run.
+          sudo apt-get install -y sysstat > /dev/null
+          mpstat -P ALL 2 > /tmp/mpstat.log 2>&1 &
+          MPSTAT_PID=$!
+
           # Preload mode
           curl -f http://localhost:7001/api/create_namespace -d '{"key":"ycsb","metadata":""}'
           PRELOAD_PATH="$PWD/build/libmvsqlite_preload.so" \
@@ -617,6 +624,10 @@ jobs:
             MVSQLITE_DATA_PLANE=http://localhost:7000 \
             RUST_LOG=off \
             ./res/ci/ycsb.sh ycsb "${{ matrix.workload }}"
+
+          kill $MPSTAT_PID || true
+          echo "=== CPU utilization during run (nproc=$(nproc)) ==="
+          cat /tmp/mpstat.log
 
   release:
     name: Release
