@@ -63,7 +63,13 @@ run_case() {
   done
   sleep 2
 
-  RUST_LOG=info /usr/local/bin/mvsqlite-shard-bench \
+  # RUST_LOG=off, not info: under 64-way concurrency with real contention (200
+  # entities, 64 workers), mvclient logs a warn!/error! line per 409/500 - with
+  # tracing_subscriber's default stdout writer locking per line, that's dozens
+  # of mutex-contended synchronous writes/sec that have nothing to do with
+  # FDB/mvSQLite's real throughput. Isolating that variable directly instead
+  # of assuming it away.
+  RUST_LOG=off /usr/local/bin/mvsqlite-shard-bench \
     --data-planes "$DATA_PLANES" --admin-api "http://localhost:8000" \
     --ns-prefix "fly_$label" --num-shards $num_shards --num-entities 200 \
     --concurrency 64 --iterations 150 --mode scaling
