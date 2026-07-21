@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     sync::atomic::{AtomicUsize, Ordering},
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::Result;
@@ -95,6 +95,10 @@ impl Server {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap();
 
+        // DIAGNOSTIC INSTRUMENTATION (temporary): timing breakdown per commit phase,
+        // to find where time actually goes under concurrent write load. Not for merge.
+        let t_start = Instant::now();
+
         // Phase 1 - Fast writes & check page existence
         let mut txn = self.db.create_trx()?;
         txn.set_option(TransactionOption::CausalReadRisky).unwrap();
@@ -149,6 +153,8 @@ impl Server {
             }
         }
 
+        let t_phase1_done = t_start.elapsed();
+
         if multi_phase {
             let commit_token_keys = ctx
                 .namespaces
@@ -174,7 +180,13 @@ impl Server {
             tracing::debug!(commit_token = hex::encode(&commit_token), "commit phase 2");
         }
 
+        let t_after_multi_phase = t_start.elapsed();
+
         // Phase 2 - content index insertion
+
+        let mut lwv_block_total = Duration::ZERO;
+        let mut plcc_block_total = Duration::ZERO;
+        let mut any_plcc_ns = false;
 
         for ns in ctx.namespaces {
             let metadata = self
@@ -209,6 +221,7 @@ impl Server {
             let plcc_enable_ns = plcc_enable && ns.use_read_set;
 
             // Idempotency & non-plcc conflict check
+            let t_lwv_start = Instant::now();
             {
                 let last_write_version_key =
                     self.key_codec.construct_last_write_version_key(ns.ns_id);
@@ -252,9 +265,12 @@ impl Server {
                     MutationType::SetVersionstampedValue,
                 );
             }
+            lwv_block_total += t_lwv_start.elapsed();
 
             // Fine-grained conflict check
+            let t_plcc_start = Instant::now();
             if plcc_enable_ns {
+                any_plcc_ns = true;
                 let reader = DeltaReader {
                     txn: &txn,
                     key_codec: &self.key_codec,
@@ -284,6 +300,7 @@ impl Server {
                     }
                 }
             }
+            plcc_block_total += t_plcc_start.elapsed();
 
             for (page_index, page_hash) in &ns.index_writes {
                 let page_key_template =
@@ -351,11 +368,14 @@ impl Server {
             );
         }
 
+        let t_before_final_commit = Instant::now();
         let versionstamp_fut = txn.get_versionstamp();
         let commit_result = txn.commit().await.map_err(|e| FdbError::from(e))?;
         let versionstamp = versionstamp_fut.await?;
+        let final_commit_us = t_before_final_commit.elapsed();
 
         // Read changelog
+        let t_before_changelog = Instant::now();
         let mut changelog: HashMap<String, Vec<u32>> = HashMap::new();
         {
             let committed_version = commit_result.committed_version()?;
@@ -376,6 +396,23 @@ impl Server {
                 }
             }
         }
+        let changelog_us = t_before_changelog.elapsed();
+
+        tracing::info!(
+            phase1_us = t_phase1_done.as_micros(),
+            multi_phase_us = (t_after_multi_phase - t_phase1_done).as_micros(),
+            lwv_block_us = lwv_block_total.as_micros(),
+            plcc_block_us = plcc_block_total.as_micros(),
+            final_commit_us = final_commit_us.as_micros(),
+            changelog_us = changelog_us.as_micros(),
+            total_us = t_start.elapsed().as_micros(),
+            multi_phase,
+            plcc_enable,
+            any_plcc_ns,
+            num_namespaces = ctx.namespaces.len(),
+            "DIAG commit phase timing"
+        );
+
         Ok(CommitResult::Committed {
             versionstamp: <[u8; 10]>::try_from(&versionstamp[..]).unwrap(),
             changelog,
