@@ -27,9 +27,15 @@ enum Mode {
 #[derive(Debug, Parser)]
 #[clap(name = "mvsqlite-shard-bench", about = "benchmark cross-shard patterns")]
 struct Opt {
-    #[clap(long)]
-    data_plane: String,
+    /// Comma-separated list of mvstore data-plane URLs. Shard i is pinned to
+    /// data_planes[i % data_planes.len()] - pass one URL per mvstore process to
+    /// test real horizontal scaling (more serving capacity as shard count grows),
+    /// not just more FDB namespaces funneled through a single process.
+    #[clap(long, value_delimiter = ',')]
+    data_planes: Vec<String>,
 
+    /// Any one mvstore instance's admin API - namespace registration lives in
+    /// FDB, so every instance sharing the same metadata/raw-data prefix sees it.
     #[clap(long)]
     admin_api: String,
 
@@ -59,6 +65,10 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let opt = Opt::parse();
 
+    if opt.data_planes.is_empty() {
+        anyhow::bail!("--data-planes must have at least one URL");
+    }
+
     let rc = reqwest::Client::new();
     let mut clients: Vec<Arc<MultiVersionClient>> = Vec::with_capacity(opt.num_shards as usize);
     for i in 0..opt.num_shards {
@@ -68,9 +78,10 @@ async fn main() -> Result<()> {
             .send()
             .await?;
 
+        let data_plane = &opt.data_planes[(i as usize) % opt.data_planes.len()];
         let client = MultiVersionClient::new(
             MultiVersionClientConfig {
-                data_plane: vec![opt.data_plane.parse()?],
+                data_plane: vec![data_plane.parse()?],
                 ns_key,
                 ns_key_hashproof: None,
                 lock_owner: None,

@@ -217,7 +217,7 @@ jobs:
           ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m &
           sleep 1
           RUST_LOG=info ./build/mvsqlite-shard-bench \
-            --data-plane http://localhost:7000 --admin-api http://localhost:7001 \
+            --data-planes http://localhost:7000 --admin-api http://localhost:7001 \
             --ns-prefix sgbench --num-shards 16 --num-entities 500 \
             --concurrency 32 --iterations 20 --mode scatter-gather
           kill %1
@@ -228,7 +228,7 @@ jobs:
           ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test2 --raw-data-prefix n &
           sleep 1
           RUST_LOG=info ./build/mvsqlite-shard-bench \
-            --data-plane http://localhost:7000 --admin-api http://localhost:7001 \
+            --data-planes http://localhost:7000 --admin-api http://localhost:7001 \
             --ns-prefix xferbench --num-shards 16 --num-entities 500 \
             --concurrency 32 --iterations 20 --mode transfer
           kill %1
@@ -239,11 +239,15 @@ jobs:
       - build
     strategy:
       matrix:
-        # Total concurrency (32) and total iterations (32 * 100 = 3200 ops) are
-        # held constant across the matrix - only how the work is partitioned
-        # across shards changes. Single mvstore process throughout, so this
-        # isolates the FDB-namespace-serialization question from mvstore process
-        # capacity (a separate axis this doesn't test).
+        # Total concurrency (64, matching the YCSB workloada thread count that
+        # originally showed the 3139->975 ops/s collapse) and total iterations
+        # are held constant - only how work is partitioned changes. One mvstore
+        # process PER SHARD, all sharing one metadata/raw-data prefix (so they
+        # see the same FDB-backed namespace registry) - this is the real
+        # deployment shape: more shards means more serving capacity, not more
+        # namespaces funneled through one process. Tests both axes at once
+        # (FDB namespace contention AND process capacity) instead of
+        # artificially isolating one.
         num_shards: [1, 2, 4, 8, 16]
     steps:
       - name: Checkout
@@ -265,12 +269,24 @@ jobs:
           set -e
           chmod +x ./build/mvstore ./build/mvsqlite-shard-bench
           export RUST_LOG=info
-          ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m &
-          sleep 1
+          NUM_SHARDS=${{ matrix.num_shards }}
+          DATA_PLANES=""
+          for i in $(seq 0 $((NUM_SHARDS - 1))); do
+            DP_PORT=$((7000 + i))
+            ADMIN_PORT=$((8000 + i))
+            ./build/mvstore --data-plane 127.0.0.1:$DP_PORT --admin-api 127.0.0.1:$ADMIN_PORT \
+              --metadata-prefix mvstore-scaling --raw-data-prefix s &
+            if [ -z "$DATA_PLANES" ]; then
+              DATA_PLANES="http://localhost:$DP_PORT"
+            else
+              DATA_PLANES="$DATA_PLANES,http://localhost:$DP_PORT"
+            fi
+          done
+          sleep 2
           RUST_LOG=info ./build/mvsqlite-shard-bench \
-            --data-plane http://localhost:7000 --admin-api http://localhost:7001 \
-            --ns-prefix scaling --num-shards ${{ matrix.num_shards }} --num-entities 200 \
-            --concurrency 32 --iterations 100 --mode scaling
+            --data-planes "$DATA_PLANES" --admin-api http://localhost:8000 \
+            --ns-prefix scaling --num-shards $NUM_SHARDS --num-entities 200 \
+            --concurrency 64 --iterations 150 --mode scaling
   stress:
     name: mvstore stress test
     runs-on: ubuntu-22.04
