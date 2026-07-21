@@ -135,7 +135,10 @@ jobs:
       - name: Build (mvstore-stress)
         run: cargo build --locked --release -p mvstore-stress
       - name: Build (mvsqlite-shard-bench)
-        run: cargo build --locked --release -p mvsqlite-shard-bench
+        # No --locked: this crate is new, so Cargo.lock needs a new entry for it.
+        # Its dependencies are otherwise identical to mvstore-stress's, already
+        # resolved in the lockfile, so this can't change any pinned version.
+        run: cargo build --release -p mvsqlite-shard-bench
       - name: Collect binaries
         run: |
           set -e
