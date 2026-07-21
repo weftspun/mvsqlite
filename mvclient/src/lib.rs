@@ -372,8 +372,13 @@ impl MultiVersionClient {
         from: Transaction,
         to: Transaction,
     ) -> Result<CommitOutput> {
-        let from_intent = from.commit_intent(None, &HashMap::new()).await?;
-        let to_intent = to.commit_intent(None, &HashMap::new()).await?;
+        // Each side's commit_intent() independently waits for its own in-flight
+        // background page writes to flush before building the intent - there's no
+        // reason to serialize those two waits back-to-back.
+        let (from_intent, to_intent) = futures::try_join!(
+            from.commit_intent(None, &HashMap::new()),
+            to.commit_intent(None, &HashMap::new()),
+        )?;
 
         let mut intents = Vec::with_capacity(2);
         intents.extend(from_intent);
