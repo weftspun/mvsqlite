@@ -115,6 +115,13 @@ jobs:
           curl -L https://github.com/apple/foundationdb/releases/download/7.1.53/foundationdb-clients_7.1.53-1_amd64.deb --output fdb-client.deb
           sudo dpkg -i fdb-client.deb
           sudo apt update && sudo apt install -y libfuse3-dev execstack
+      - name: Build (mvsqlite-shard-bench)
+        # No --locked, and built first: this crate is new, so Cargo.lock needs a new
+        # entry for it - adding a workspace member invalidates --locked for every
+        # crate's build, not just this one's, until the lockfile is brought current.
+        # Its dependencies are otherwise identical to mvstore-stress's, already
+        # resolved, so this can't change any pinned version, only add this entry.
+        run: cargo build --release -p mvsqlite-shard-bench
       - name: Build (mvstore)
         run: cargo build --locked --release -p mvstore
       - name: Build (mvsqlite)
@@ -141,6 +148,7 @@ jobs:
           cd build
           cp ../target/release/mvstore ./
           cp ../target/release/mvstore-stress ./
+          cp ../target/release/mvsqlite-shard-bench ./
           cp ../target/release/mvsqlite-fuse ./
           cp ../mvsqlite-preload/libmvsqlite_preload.so ./
           cp ../mvsqlite-preload/libmvsqlite.a ./
@@ -181,6 +189,185 @@ jobs:
         with:
           name: deb
           path: ./deb
+  shard-bench:
+    name: cross-shard pattern benchmark
+    runs-on: ubuntu-22.04
+    needs:
+      - build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          set -e
+          curl -L https://github.com/apple/foundationdb/releases/download/7.1.53/foundationdb-clients_7.1.53-1_amd64.deb --output fdb-client.deb
+          sudo dpkg -i fdb-client.deb
+          curl -L https://github.com/apple/foundationdb/releases/download/7.1.53/foundationdb-server_7.1.53-1_amd64.deb --output fdb-server.deb
+          sudo dpkg -i fdb-server.deb
+      - name: Fetch binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: build
+          path: ./build
+      - name: Run scatter-gather benchmark
+        run: |
+          set -e
+          chmod +x ./build/mvstore ./build/mvsqlite-shard-bench
+          export RUST_LOG=info
+          ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m &
+          sleep 1
+          RUST_LOG=info ./build/mvsqlite-shard-bench \
+            --data-planes http://localhost:7000 --admin-api http://localhost:7001 \
+            --ns-prefix sgbench --num-shards 16 --num-entities 500 \
+            --concurrency 32 --iterations 20 --mode scatter-gather
+          kill %1
+      - name: Run transfer benchmark
+        run: |
+          set -e
+          export RUST_LOG=info
+          ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test2 --raw-data-prefix n &
+          sleep 1
+          RUST_LOG=info ./build/mvsqlite-shard-bench \
+            --data-planes http://localhost:7000 --admin-api http://localhost:7001 \
+            --ns-prefix xferbench --num-shards 16 --num-entities 500 \
+            --concurrency 32 --iterations 20 --mode transfer
+          kill %1
+  linear-scaling:
+    name: linear scaling (num-shards=${{ matrix.num_shards }})
+    runs-on: ubuntu-22.04
+    needs:
+      - build
+    strategy:
+      matrix:
+        # Total concurrency (64, matching the YCSB workloada thread count that
+        # originally showed the 3139->975 ops/s collapse) and total iterations
+        # are held constant - only how work is partitioned changes. One mvstore
+        # process PER SHARD, all sharing one metadata/raw-data prefix (so they
+        # see the same FDB-backed namespace registry) - this is the real
+        # deployment shape: more shards means more serving capacity, not more
+        # namespaces funneled through one process. Tests both axes at once
+        # (FDB namespace contention AND process capacity) instead of
+        # artificially isolating one.
+        num_shards: [1, 2, 4, 8, 16]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          set -e
+          curl -L https://github.com/apple/foundationdb/releases/download/7.1.53/foundationdb-clients_7.1.53-1_amd64.deb --output fdb-client.deb
+          sudo dpkg -i fdb-client.deb
+          curl -L https://github.com/apple/foundationdb/releases/download/7.1.53/foundationdb-server_7.1.53-1_amd64.deb --output fdb-server.deb
+          sudo dpkg -i fdb-server.deb
+      - name: Configure multi-process FDB (one fdbserver per core)
+        # FDB's own docs: "The default installation runs only one FoundationDB
+        # server process per machine (which will use only one CPU core)... Most
+        # users will want to maximize performance by running one FoundationDB
+        # server process per core." The earlier version of this job never did
+        # this, so every mvstore process - regardless of shard count - funneled
+        # through one single-core fdbserver, which is the likely reason the
+        # earlier run showed a flat throughput curve across num_shards.
+        run: |
+          set -e
+          NPROC=$(nproc)
+          echo "cores available: $NPROC"
+          for i in $(seq 1 $((NPROC - 1))); do
+            PORT=$((4500 + i))
+            {
+              echo ""
+              echo "[fdbserver.$PORT]"
+            } | sudo tee -a /etc/foundationdb/foundationdb.conf > /dev/null
+          done
+          cat /etc/foundationdb/foundationdb.conf
+          sudo service foundationdb restart
+          sleep 3
+          sudo fdbcli --exec "status" || true
+      - name: Fetch binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: build
+          path: ./build
+      - name: Run scaling benchmark
+        run: |
+          set -e
+          chmod +x ./build/mvstore ./build/mvsqlite-shard-bench
+          export RUST_LOG=info
+          NUM_SHARDS=${{ matrix.num_shards }}
+          DATA_PLANES=""
+          for i in $(seq 0 $((NUM_SHARDS - 1))); do
+            DP_PORT=$((7000 + i))
+            ADMIN_PORT=$((8000 + i))
+            ./build/mvstore --data-plane 127.0.0.1:$DP_PORT --admin-api 127.0.0.1:$ADMIN_PORT \
+              --metadata-prefix mvstore-scaling --raw-data-prefix s &
+            if [ -z "$DATA_PLANES" ]; then
+              DATA_PLANES="http://localhost:$DP_PORT"
+            else
+              DATA_PLANES="$DATA_PLANES,http://localhost:$DP_PORT"
+            fi
+          done
+          sleep 2
+          RUST_LOG=info ./build/mvsqlite-shard-bench \
+            --data-planes "$DATA_PLANES" --admin-api http://localhost:8000 \
+            --ns-prefix scaling --num-shards $NUM_SHARDS --num-entities 200 \
+            --concurrency 64 --iterations 150 --mode scaling
+  logging-overhead-check:
+    name: does log spam explain the throughput ceiling?
+    runs-on: ubuntu-22.04
+    needs:
+      - build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          set -e
+          curl -L https://github.com/apple/foundationdb/releases/download/7.1.53/foundationdb-clients_7.1.53-1_amd64.deb --output fdb-client.deb
+          sudo dpkg -i fdb-client.deb
+          curl -L https://github.com/apple/foundationdb/releases/download/7.1.53/foundationdb-server_7.1.53-1_amd64.deb --output fdb-server.deb
+          sudo dpkg -i fdb-server.deb
+      - name: Configure multi-process FDB (one fdbserver per core)
+        run: |
+          set -e
+          NPROC=$(nproc)
+          for i in $(seq 1 $((NPROC - 1))); do
+            PORT=$((4500 + i))
+            { echo ""; echo "[fdbserver.$PORT]"; } | sudo tee -a /etc/foundationdb/foundationdb.conf > /dev/null
+          done
+          sudo service foundationdb restart
+          sleep 3
+          sudo fdbcli --exec "status" || true
+      - name: Fetch binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: build
+          path: ./build
+      - name: RUST_LOG=info run (with 409/500 warn/error spam)
+        run: |
+          set -e
+          chmod +x ./build/mvstore ./build/mvsqlite-shard-bench
+          ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:8000 \
+            --metadata-prefix mvstore-logtest-info --raw-data-prefix li &
+          sleep 2
+          RUST_LOG=info ./build/mvsqlite-shard-bench \
+            --data-planes http://localhost:7000 --admin-api http://localhost:8000 \
+            --ns-prefix loginfo --num-shards 1 --num-entities 200 \
+            --concurrency 64 --iterations 150 --mode scaling
+          kill %1 || true
+          sleep 1
+      - name: RUST_LOG suppressing mvclient noise, keeping the benchmark's own summary
+        run: |
+          set -e
+          ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:8000 \
+            --metadata-prefix mvstore-logtest-off --raw-data-prefix lo &
+          sleep 2
+          # off by default, but explicitly re-enable info for the benchmark's own
+          # module (the "BENCH result"/"SCALING summary" lines) - only mvclient's
+          # per-op 409/500 warn!/error! spam is actually being silenced here.
+          RUST_LOG=off,mvsqlite_shard_bench=info ./build/mvsqlite-shard-bench \
+            --data-planes http://localhost:7000 --admin-api http://localhost:8000 \
+            --ns-prefix logoff --num-shards 1 --num-entities 200 \
+            --concurrency 64 --iterations 150 --mode scaling
+          kill %1 || true
   stress:
     name: mvstore stress test
     runs-on: ubuntu-22.04

@@ -353,6 +353,49 @@ impl MultiVersionClient {
 
         Ok(res)
     }
+
+    /// Atomically commit two transactions against two different namespaces
+    /// together, as a single FDB transaction, via the same multi-namespace commit
+    /// path a single-namespace commit already uses - namespaces are just key
+    /// prefixes in one FDB cluster, so this needs no two-phase commit protocol or
+    /// saga: it either fully happens or fully doesn't, so there is no window where
+    /// both namespaces or neither namespace reflects the row's new location (e.g.
+    /// a row moved from one namespace to another via a delete in `source` and an
+    /// insert in `destination`).
+    ///
+    /// This is deliberately narrow - exactly two transactions, named for exactly
+    /// one purpose - rather than a general "commit across N namespaces"
+    /// capability. Cross-namespace operations should stay explicit and rare; this
+    /// is not a building block for transparently hiding namespace boundaries
+    /// elsewhere.
+    pub async fn commit_across_two_namespaces(
+        &self,
+        dp: Option<&Url>,
+        source: Transaction,
+        destination: Transaction,
+    ) -> Result<CommitOutput> {
+        // Each side's commit_intent() independently waits for its own in-flight
+        // background page writes to flush before building the intent - there's no
+        // reason to serialize those two waits back-to-back.
+        let empty_fast_writes = HashMap::new();
+        let (source_intent, destination_intent) = futures::try_join!(
+            source.commit_intent(None, &empty_fast_writes),
+            destination.commit_intent(None, &empty_fast_writes),
+        )?;
+
+        let mut intents = Vec::with_capacity(2);
+        intents.extend(source_intent);
+        intents.extend(destination_intent);
+
+        if intents.is_empty() {
+            anyhow::bail!("commit_across_two_namespaces: neither side has anything to commit");
+        }
+
+        Ok(match self.apply_commit_intents(dp, &intents).await? {
+            Some(x) => CommitOutput::Committed(x),
+            None => CommitOutput::Conflict,
+        })
+    }
 }
 
 pub struct Transaction {

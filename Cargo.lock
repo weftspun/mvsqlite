@@ -1335,6 +1335,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "mvsqlite-shard-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures",
+ "mvclient",
+ "rand",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "mvstore"
 version = "0.3.1"
 dependencies = [
