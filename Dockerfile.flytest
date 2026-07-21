@@ -15,5 +15,8 @@ RUN curl -L https://github.com/apple/foundationdb/releases/download/7.1.53/found
 COPY --from=build /src/target/release/mvstore /usr/local/bin/mvstore
 COPY --from=build /src/target/release/mvsqlite-shard-bench /usr/local/bin/mvsqlite-shard-bench
 COPY flytest-entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+# Windows checkouts of this repo store the script with CRLF line endings,
+# which corrupts the #!/bin/bash shebang and makes Linux report the file as
+# missing entirely - strip \r before making it executable.
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 CMD ["/entrypoint.sh"]
