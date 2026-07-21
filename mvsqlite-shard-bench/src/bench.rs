@@ -262,3 +262,82 @@ pub async fn run_transfer(
 
     Ok(())
 }
+
+/// The actual linear-scaling test. A workloada-shaped workload (50% read, 50%
+/// update, uniform random key, fresh transaction per op) where every worker is
+/// pinned to exactly one shard for its entire run - no cross-shard access at all,
+/// unlike scatter-gather/transfer above. Run this at num_shards=1,2,4,8,... with
+/// total concurrency held constant (split evenly across shards) to see whether
+/// aggregate throughput actually scales with shard count, or plateaus.
+pub async fn run_scaling(
+    clients: Vec<Arc<MultiVersionClient>>,
+    num_entities_per_shard: u32,
+    concurrency_per_shard: usize,
+    iterations: usize,
+) -> Result<()> {
+    // Seed every shard's entities concurrently (across shards, and across entities
+    // within each shard) - this is one-time setup cost, not part of what's timed.
+    let setup_futs = clients.iter().map(|client| async move {
+        let writes = (0..num_entities_per_shard).map(|entity_id| async move {
+            let mut txn = client.create_transaction(None).await?;
+            txn.write_many(&[(entity_id, b"init".as_slice())]).await?;
+            txn.commit(None, &Default::default()).await
+        });
+        join_all(writes).await
+    });
+    for shard_results in join_all(setup_futs).await {
+        for r in shard_results {
+            r?;
+        }
+    }
+    tracing::info!(
+        num_shards = clients.len(),
+        num_entities_per_shard,
+        concurrency_per_shard,
+        total_concurrency = clients.len() * concurrency_per_shard,
+        "scaling setup done"
+    );
+
+    let stats = Arc::new(LatencyStats::new());
+    let clients = Arc::new(clients);
+
+    let start = Instant::now();
+    let mut handles = Vec::with_capacity(clients.len() * concurrency_per_shard);
+    for client in clients.iter() {
+        for _ in 0..concurrency_per_shard {
+            let client = client.clone();
+            let stats = stats.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..iterations {
+                    let entity_id = thread_rng().gen_range(0..num_entities_per_shard);
+                    let is_read = thread_rng().gen_bool(0.5);
+                    let t0 = Instant::now();
+                    if is_read {
+                        if let Ok(txn) = client.create_transaction(None).await {
+                            let _ = txn.read_many_nomark(&[entity_id]).await;
+                        }
+                    } else if let Ok(mut txn) = client.create_transaction(None).await {
+                        let mut data = [0u8; 32];
+                        thread_rng().fill(&mut data);
+                        if txn.write_many(&[(entity_id, &data)]).await.is_ok() {
+                            let _ = txn.commit(None, &Default::default()).await;
+                        }
+                    }
+                    stats.record(t0.elapsed());
+                }
+            }));
+        }
+    }
+    for h in handles {
+        h.await?;
+    }
+    let elapsed = start.elapsed();
+    stats.report("scaling", elapsed);
+    tracing::info!(
+        num_shards = clients.len(),
+        total_concurrency = clients.len() * concurrency_per_shard,
+        "SCALING summary"
+    );
+
+    Ok(())
+}

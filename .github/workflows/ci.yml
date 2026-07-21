@@ -232,6 +232,45 @@ jobs:
             --ns-prefix xferbench --num-shards 16 --num-entities 500 \
             --concurrency 32 --iterations 20 --mode transfer
           kill %1
+  linear-scaling:
+    name: linear scaling (num-shards=${{ matrix.num_shards }})
+    runs-on: ubuntu-22.04
+    needs:
+      - build
+    strategy:
+      matrix:
+        # Total concurrency (32) and total iterations (32 * 100 = 3200 ops) are
+        # held constant across the matrix - only how the work is partitioned
+        # across shards changes. Single mvstore process throughout, so this
+        # isolates the FDB-namespace-serialization question from mvstore process
+        # capacity (a separate axis this doesn't test).
+        num_shards: [1, 2, 4, 8, 16]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          set -e
+          curl -L https://github.com/apple/foundationdb/releases/download/7.1.53/foundationdb-clients_7.1.53-1_amd64.deb --output fdb-client.deb
+          sudo dpkg -i fdb-client.deb
+          curl -L https://github.com/apple/foundationdb/releases/download/7.1.53/foundationdb-server_7.1.53-1_amd64.deb --output fdb-server.deb
+          sudo dpkg -i fdb-server.deb
+      - name: Fetch binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: build
+          path: ./build
+      - name: Run scaling benchmark
+        run: |
+          set -e
+          chmod +x ./build/mvstore ./build/mvsqlite-shard-bench
+          export RUST_LOG=info
+          ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m &
+          sleep 1
+          RUST_LOG=info ./build/mvsqlite-shard-bench \
+            --data-plane http://localhost:7000 --admin-api http://localhost:7001 \
+            --ns-prefix scaling --num-shards ${{ matrix.num_shards }} --num-entities 200 \
+            --concurrency 32 --iterations 100 --mode scaling
   stress:
     name: mvstore stress test
     runs-on: ubuntu-22.04

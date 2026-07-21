@@ -15,6 +15,13 @@ enum Mode {
     /// commit_across_two_namespaces, verifying it lands in exactly one shard
     /// afterward.
     Transfer,
+    /// The actual linear-scaling test: a workloada-shaped (50% read / 50% update,
+    /// uniform random key) workload where every worker is pinned to exactly one
+    /// shard - no cross-shard access at all. --concurrency is TOTAL client
+    /// concurrency, split evenly across shards, so it stays constant as
+    /// --num-shards varies - run this at num-shards=1,2,4,8,... to see whether
+    /// aggregate throughput actually scales with shard count.
+    Scaling,
 }
 
 #[derive(Debug, Parser)]
@@ -80,6 +87,16 @@ async fn main() -> Result<()> {
         }
         Mode::Transfer => {
             bench::run_transfer(clients, opt.num_entities, opt.concurrency, opt.iterations).await?
+        }
+        Mode::Scaling => {
+            let concurrency_per_shard = (opt.concurrency / clients.len()).max(1);
+            bench::run_scaling(
+                clients,
+                opt.num_entities,
+                concurrency_per_shard,
+                opt.iterations,
+            )
+            .await?
         }
     }
 
