@@ -353,6 +353,41 @@ impl MultiVersionClient {
 
         Ok(res)
     }
+
+    /// Atomically hand off authority for an entity from one shard/namespace to
+    /// another: `from`'s writes (e.g. deleting/tombstoning the entity) and `to`'s
+    /// writes (e.g. inserting it) commit together in a single FDB transaction, via
+    /// the same multi-namespace commit path a single-namespace commit already uses
+    /// - shards are just key prefixes in one FDB cluster, so this needs no 2PC or
+    /// saga: it either fully happens or fully doesn't, so there is no window where
+    /// both shards or neither shard owns the entity.
+    ///
+    /// This is deliberately narrow - exactly two transactions, named for exactly
+    /// one purpose - rather than a general "commit across N shards" capability.
+    /// Cross-shard operations should stay explicit and rare; this is not a
+    /// building block for transparently hiding shard boundaries elsewhere.
+    pub async fn transfer_authority(
+        &self,
+        dp: Option<&Url>,
+        from: Transaction,
+        to: Transaction,
+    ) -> Result<CommitOutput> {
+        let from_intent = from.commit_intent(None, &HashMap::new()).await?;
+        let to_intent = to.commit_intent(None, &HashMap::new()).await?;
+
+        let mut intents = Vec::with_capacity(2);
+        intents.extend(from_intent);
+        intents.extend(to_intent);
+
+        if intents.is_empty() {
+            anyhow::bail!("transfer_authority: neither side has anything to commit");
+        }
+
+        Ok(match self.apply_commit_intents(dp, &intents).await? {
+            Some(x) => CommitOutput::Committed(x),
+            None => CommitOutput::Conflict,
+        })
+    }
 }
 
 pub struct Transaction {
