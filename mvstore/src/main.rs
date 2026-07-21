@@ -63,6 +63,13 @@ struct Opt {
     #[clap(long)]
     auto_create_namespace: bool,
 
+    /// Require namespace keys to end with "_NNNN" (four digits), the naming
+    /// convention produced by the mvsqlite_shard SQLite extension. Rejects
+    /// creation of any namespace that doesn't match, at both the explicit
+    /// admin API and namespace auto-creation.
+    #[clap(long, env = "MVSTORE_REQUIRE_SHARDED_NAMESPACE_NAMES")]
+    require_sharded_namespace_names: bool,
+
     /// Content cache size in number of pages.
     #[clap(long, env = "MVSTORE_CONTENT_CACHE_SIZE", default_value = "0")]
     content_cache_size: usize,
@@ -173,6 +180,11 @@ async fn async_main(opt: Opt) -> Result<()> {
     if opt.wire_zstd {
         delta::reader::WIRE_ZSTD.store(true, Ordering::Relaxed);
         tracing::info!("enabled wire zstd");
+    }
+
+    if opt.require_sharded_namespace_names {
+        server::REQUIRE_SHARDED_NAMESPACE_NAMES.store(true, Ordering::Relaxed);
+        tracing::info!("requiring sharded namespace names");
     }
 
     let server = Server::open(ServerConfig {

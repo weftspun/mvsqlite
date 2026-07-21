@@ -62,6 +62,7 @@ enum GetError {
 #[derive(Debug)]
 enum CreateNamespaceError {
     AlreadyExist,
+    NotSharded,
 }
 
 impl std::fmt::Display for CreateNamespaceError {
@@ -71,6 +72,27 @@ impl std::fmt::Display for CreateNamespaceError {
 }
 
 impl std::error::Error for CreateNamespaceError {}
+
+/// When enabled, namespace keys must end with an underscore followed by exactly
+/// four ASCII digits (e.g. "world_0007") - the naming convention produced by the
+/// mvsqlite_shard SQLite extension's `mvsqlite_shard_namespace()` function.
+///
+/// This is enforced here, at the single point every namespace comes into being
+/// (both the explicit /api/create_namespace call and namespace auto-creation on
+/// first data-plane access), so it can't be bypassed by a client-side mistake or
+/// omission the way a naming *convention* alone could be - a namespace that
+/// doesn't match simply never gets created.
+pub static REQUIRE_SHARDED_NAMESPACE_NAMES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn is_sharded_namespace_name(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    if bytes.len() < 5 {
+        return false;
+    }
+    let suffix = &bytes[bytes.len() - 5..];
+    suffix[0] == b'_' && suffix[1..].iter().all(|b| b.is_ascii_digit())
+}
 
 pub struct Server {
     pub db: Database,
@@ -273,6 +295,11 @@ impl Server {
         key: &str,
         overlay_base: Option<NamespaceOverlayBase>,
     ) -> Result<()> {
+        if REQUIRE_SHARDED_NAMESPACE_NAMES.load(Ordering::Relaxed) && !is_sharded_namespace_name(key)
+        {
+            return Err(anyhow::Error::new(CreateNamespaceError::NotSharded));
+        }
+
         let nskey_key = self.key_codec.construct_nskey_key(&key);
         let nsmd = NamespaceMetadata {
             lock: None,
@@ -339,6 +366,13 @@ impl Server {
                             return Ok(Response::builder()
                                 .status(422)
                                 .body(Body::from("this key already exists\n"))?);
+                        }
+                        Some(CreateNamespaceError::NotSharded) => {
+                            return Ok(Response::builder()
+                                .status(422)
+                                .body(Body::from(
+                                    "this store requires sharded namespace names (e.g. \"world_0007\") - see mvsqlite_shard_namespace()\n",
+                                ))?);
                         }
                         _ => {
                             return Ok(Response::builder()

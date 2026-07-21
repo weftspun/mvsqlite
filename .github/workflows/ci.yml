@@ -181,6 +181,54 @@ jobs:
         with:
           name: deb
           path: ./deb
+  shard-ext:
+    name: mvsqlite_shard extension
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          set -e
+          sudo apt update && sudo apt install -y sqlite3
+      - name: Build extension
+        run: make -C ./mvsqlite-shard-ext build
+      - name: Smoke test
+        run: |
+          set -e
+          out=$(sqlite3 <<'EOF'
+          .load ./mvsqlite-shard-ext/libmvsqlite_shard
+          SELECT mvsqlite_shard_index('player-1234', 16);
+          SELECT mvsqlite_shard_namespace('world', 'player-1234', 16);
+          EOF
+          )
+          echo "$out"
+          idx=$(echo "$out" | sed -n '1p')
+          ns=$(echo "$out" | sed -n '2p')
+          # Determinism check: same key must always route the same way.
+          idx2=$(sqlite3 :memory: -cmd ".load ./mvsqlite-shard-ext/libmvsqlite_shard" "SELECT mvsqlite_shard_index('player-1234', 16);")
+          if [ "$idx" != "$idx2" ]; then
+            echo "non-deterministic shard index: $idx vs $idx2"
+            exit 1
+          fi
+          if [ "$ns" != "world_$(printf '%04d' "$idx")" ]; then
+            echo "namespace name does not match shard index: idx=$idx ns=$ns"
+            exit 1
+          fi
+          if [ "$idx" -lt 0 ] || [ "$idx" -ge 16 ]; then
+            echo "shard index out of range: $idx"
+            exit 1
+          fi
+          # ATTACH must be denied on any connection that loaded the extension.
+          set +e
+          attach_out=$(sqlite3 :memory: -cmd ".load ./mvsqlite-shard-ext/libmvsqlite_shard" "ATTACH DATABASE ':memory:' AS other;" 2>&1)
+          attach_rc=$?
+          set -e
+          echo "$attach_out"
+          if [ "$attach_rc" -eq 0 ]; then
+            echo "ATTACH should have been denied but succeeded"
+            exit 1
+          fi
   stress:
     name: mvstore stress test
     runs-on: ubuntu-22.04
