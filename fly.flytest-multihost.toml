@@ -1,0 +1,5 @@
+app = "mvsqlite-multihost-flytest"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile.flytest-multihost"

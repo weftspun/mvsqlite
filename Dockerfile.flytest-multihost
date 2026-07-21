@@ -1,0 +1,22 @@
+FROM rust:1-bookworm AS build
+WORKDIR /src
+RUN apt-get update && apt-get install -y clang libclang-dev && rm -rf /var/lib/apt/lists/*
+RUN curl -L https://github.com/apple/foundationdb/releases/download/7.1.53/foundationdb-clients_7.1.53-1_amd64.deb -o fdb-client.deb \
+    && dpkg -i fdb-client.deb
+COPY . .
+RUN cargo build --release -p mvstore -p mvsqlite-shard-bench
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y curl ca-certificates dnsutils && rm -rf /var/lib/apt/lists/*
+RUN curl -L https://github.com/apple/foundationdb/releases/download/7.1.53/foundationdb-clients_7.1.53-1_amd64.deb -o fdb-client.deb \
+    && curl -L https://github.com/apple/foundationdb/releases/download/7.1.53/foundationdb-server_7.1.53-1_amd64.deb -o fdb-server.deb \
+    && dpkg -i fdb-client.deb fdb-server.deb || true \
+    && rm -f fdb-client.deb fdb-server.deb
+COPY --from=build /src/target/release/mvstore /usr/local/bin/mvstore
+COPY --from=build /src/target/release/mvsqlite-shard-bench /usr/local/bin/mvsqlite-shard-bench
+COPY flytest-multihost-entrypoint.sh /entrypoint.sh
+COPY flytest-multihost-driver.sh /driver.sh
+# Windows checkouts store these with CRLF line endings, which corrupts the
+# #!/bin/bash shebang and makes Linux report the file as missing entirely.
+RUN sed -i 's/\r$//' /entrypoint.sh /driver.sh && chmod +x /entrypoint.sh /driver.sh
+CMD ["/entrypoint.sh"]
