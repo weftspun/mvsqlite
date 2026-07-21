@@ -1,0 +1,11 @@
+app = "mvsqlite-scaling-flytest"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile.flytest"
+
+[[vm]]
+  size = "performance-1x"
+
+[processes]
+  app = "/entrypoint.sh"
