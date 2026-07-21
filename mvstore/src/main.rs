@@ -1,18 +1,6 @@
-mod commit;
-mod delta;
-mod fixed;
 mod gc;
-mod keys;
 mod lock;
-mod metadata;
-mod nslock;
-mod page;
-mod replica;
 mod server;
-mod stat;
-mod time2version;
-mod util;
-mod write;
 
 use std::{net::SocketAddr, sync::atomic::Ordering};
 
@@ -149,17 +137,17 @@ async fn async_main(opt: Opt) -> Result<()> {
     }
 
     if let Some(x) = opt.knob_commit_multi_phase_threshold {
-        commit::COMMIT_MULTI_PHASE_THRESHOLD.store(x, Ordering::Relaxed);
+        mvsqlite_core::commit::COMMIT_MULTI_PHASE_THRESHOLD.store(x, Ordering::Relaxed);
         tracing::info!(value = x, "configured commit multi-phase threshold");
     }
 
     if let Some(x) = opt.knob_plcc_read_set_size_threshold {
-        commit::PLCC_READ_SET_SIZE_THRESHOLD.store(x, Ordering::Relaxed);
+        mvsqlite_core::commit::PLCC_READ_SET_SIZE_THRESHOLD.store(x, Ordering::Relaxed);
         tracing::info!(value = x, "configured plcc read set size threshold");
     }
 
     if let Some(x) = opt.knob_nslock_rollback_scan_batch_size {
-        nslock::NSLOCK_ROLLBACK_SCAN_BATCH_SIZE.store(x, Ordering::Relaxed);
+        mvsqlite_core::nslock::NSLOCK_ROLLBACK_SCAN_BATCH_SIZE.store(x, Ordering::Relaxed);
         tracing::info!(value = x, "configured nslock rollback scan batch size");
     }
 
@@ -171,7 +159,7 @@ async fn async_main(opt: Opt) -> Result<()> {
     }
 
     if opt.wire_zstd {
-        delta::reader::WIRE_ZSTD.store(true, Ordering::Relaxed);
+        mvsqlite_core::delta::reader::WIRE_ZSTD.store(true, Ordering::Relaxed);
         tracing::info!("enabled wire zstd");
     }
 

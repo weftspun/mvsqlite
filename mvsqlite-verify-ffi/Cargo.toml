@@ -1,0 +1,13 @@
+[package]
+name = "mvsqlite-verify-ffi"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "C-ABI shim exposing mvsqlite-core's real conflict-decision logic to the Lean plausible-witness-dag verification harness"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+mvsqlite-core = { path = "../mvsqlite-core" }

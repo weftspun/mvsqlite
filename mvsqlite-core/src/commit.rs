@@ -15,10 +15,10 @@ use rand::RngCore;
 
 use crate::{
     delta::reader::DeltaReader,
-    server::Server,
     util::{decode_version, generate_suffix_versionstamp_atomic_op, GoneError},
-    util::{get_txn_read_version_as_versionstamp, ContentIndex},
+    util::{get_txn_read_version_as_versionstamp, version_conflicts, ContentIndex},
     write::{WriteApplier, WriteApplierContext, WriteRequest},
+    Core,
 };
 
 pub static COMMIT_MULTI_PHASE_THRESHOLD: AtomicUsize = AtomicUsize::new(1000);
@@ -53,7 +53,7 @@ pub struct CommitNamespaceContext<'a> {
     pub metadata: Option<String>,
 }
 
-impl Server {
+impl Core {
     pub async fn commit<'a>(&self, ctx: CommitContext<'a>) -> Result<CommitResult> {
         let num_distinct_ns_id = ctx
             .namespaces
@@ -234,7 +234,7 @@ impl Server {
                                 });
                             }
 
-                            if ns.client_assumed_version < actual_last_write_version {
+                            if version_conflicts(actual_last_write_version, ns.client_assumed_version) {
                                 if !plcc_enable_ns {
                                     return Ok(CommitResult::Conflict);
                                 }
@@ -272,7 +272,7 @@ impl Server {
                     let data = data?;
                     if let Some((version, _)) = data {
                         let version = decode_version(&version)?;
-                        if version > ns.client_assumed_version {
+                        if version_conflicts(version, ns.client_assumed_version) {
                             tracing::warn!(
                                 page,
                                 page_version = hex::encode(&version),

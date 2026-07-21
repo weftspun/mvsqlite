@@ -100,3 +100,12 @@ pub fn extract_beu32_suffix(data: &[u8]) -> u32 {
     assert!(data.len() >= 4);
     u32::from_be_bytes(<[u8; 4]>::try_from(&data[data.len() - 4..]).unwrap())
 }
+
+/// The PLCC/LWV conflict-detection rule, shared by every conflict check in
+/// `commit.rs`: a version observed by a transaction conflicts with the
+/// current version of the same resource iff the current version is strictly
+/// newer. Versions are 10-byte big-endian (8-byte FDB commit version + 2-byte
+/// in-batch order), so byte-lexicographic comparison is numeric comparison.
+pub fn version_conflicts(current_version: [u8; 10], observed_version: [u8; 10]) -> bool {
+    current_version > observed_version
+}

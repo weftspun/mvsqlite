@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::util::{decode_version, get_last_write_version};
-use crate::{server::Server, util::GoneError};
+use crate::{util::GoneError, Core};
 use anyhow::Result;
 use foundationdb::{
     options::{StreamingMode, TransactionOption},
@@ -24,7 +24,7 @@ pub struct StatResponse {
     pub interval: Option<Vec<u32>>,
 }
 
-impl Server {
+impl Core {
     pub async fn stat(
         &self,
         ns_id: [u8; 10],

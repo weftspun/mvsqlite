@@ -1309,6 +1309,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "mvsqlite-core"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "bytes",
+ "constant_time_eq 0.2.6",
+ "foundationdb",
+ "futures",
+ "heapless",
+ "hex",
+ "itertools",
+ "moka",
+ "rand",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "zstd 0.11.2+zstd.1.5.2",
+]
+
+[[package]]
 name = "mvsqlite-fuse"
 version = "0.1.0"
 dependencies = [
@@ -1335,6 +1359,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mvsqlite-verify-ffi"
+version = "0.1.0"
+dependencies = [
+ "mvsqlite-core",
+]
+
+[[package]]
 name = "mvstore"
 version = "0.3.1"
 dependencies = [
@@ -1354,6 +1385,7 @@ dependencies = [
  "lmdb-rkv",
  "log",
  "moka",
+ "mvsqlite-core",
  "rand",
  "rmp-serde",
  "serde",

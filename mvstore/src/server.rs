@@ -4,14 +4,26 @@ use bytes::{Bytes, BytesMut};
 use foundationdb::{
     options::{MutationType, StreamingMode, TransactionOption},
     tuple::unpack,
-    Database, FdbError, RangeOption, Transaction,
+    FdbError, RangeOption, Transaction,
 };
 use futures::{StreamExt, TryStreamExt};
 use hyper::{
     body::{HttpBody, Sender},
     Body, Request, Response,
 };
-use moka::future::Cache;
+use mvsqlite_core::{
+    commit::{CommitContext, CommitNamespaceContext, CommitResult},
+    delta::reader::{DeltaReader, WIRE_ZSTD},
+    fixed::FixedString,
+    metadata::NamespaceOverlayBase,
+    namespace::CreateNamespaceError,
+    nslock::{acquire_nslock, release_nslock, NslockOutcome, NslockReleaseMode},
+    page::{Page, MAX_PAGE_SIZE},
+    time2version::time2version,
+    util::{decode_version, GoneError},
+    write::{WriteApplier, WriteApplierContext, WriteRequest, WriteResponse},
+    Core, CoreConfig,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -30,20 +42,7 @@ use tokio_util::{
     io::StreamReader,
 };
 
-use crate::{
-    commit::{CommitContext, CommitNamespaceContext, CommitResult},
-    delta::reader::{DeltaReader, WIRE_ZSTD},
-    fixed::FixedString,
-    keys::KeyCodec,
-    lock::DistributedLock,
-    metadata::{NamespaceMetadata, NamespaceMetadataCache, NamespaceOverlayBase},
-    nslock::{acquire_nslock, release_nslock, NslockReleaseMode},
-    page::{Page, MAX_PAGE_SIZE},
-    replica::ReplicaManager,
-    time2version::time2version,
-    util::{decode_version, generate_suffix_versionstamp_atomic_op, GoneError},
-    write::{WriteApplier, WriteApplierContext, WriteRequest, WriteResponse},
-};
+use crate::lock::DistributedLock;
 
 const MAX_MESSAGE_SIZE: usize = 40 * 1024; // 40 KiB
 const MAX_PAGES_PER_BATCH_READ: usize = 200;
@@ -54,48 +53,59 @@ const MAX_PAGES_PER_BATCH_WRITE: usize = 20;
 const COMMITTED_VERSION_HDR_NAME: &str = "x-committed-version";
 const LAST_VERSION_HDR_NAME: &str = "x-last-version";
 
-enum GetError {
-    NotFound,
-    Other(anyhow::Error),
-}
-
-#[derive(Debug)]
-enum CreateNamespaceError {
-    AlreadyExist,
-}
-
-impl std::fmt::Display for CreateNamespaceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
-    }
-}
-
-impl std::error::Error for CreateNamespaceError {}
-
 pub struct Server {
-    pub db: Database,
-
-    pub key_codec: Arc<KeyCodec>,
-
-    nskey_cache: Cache<String, [u8; 10]>,
-    read_version_cache: Cache<[u8; 10], i64>,
-    pub read_version_and_nsid_to_lwv_cache: Cache<(i64, [u8; 10]), [u8; 10]>,
-    pub replica_manager: Option<ReplicaManager>,
-    pub ns_metadata_cache: NamespaceMetadataCache,
-
-    pub content_cache: Option<Cache<[u8; 32], Bytes>>,
-
-    pub auto_create_ns: bool,
+    pub core: Core,
 }
 
-pub struct ServerConfig {
-    pub cluster: String,
-    pub raw_data_prefix: String,
-    pub metadata_prefix: String,
-    pub read_only: bool,
-    pub dr_tag: String,
-    pub content_cache_size: usize,
-    pub auto_create_ns: bool,
+pub type ServerConfig = CoreConfig;
+
+fn nslock_acquire_response(outcome: NslockOutcome) -> Result<Response<Body>> {
+    Ok(match outcome {
+        NslockOutcome::Ok | NslockOutcome::AlreadyHeldBySelf => {
+            Response::builder().status(201).body(Body::empty())?
+        }
+        NslockOutcome::InvalidOwner => Response::builder()
+            .status(400)
+            .body(Body::from("invalid owner\n"))?,
+        NslockOutcome::OwnedByOther(owner) => Response::builder()
+            .status(409)
+            .header("x-lock-owner", &owner)
+            .body(Body::from("namespace is locked by another owner\n"))?,
+        NslockOutcome::NotLocked | NslockOutcome::Gone => {
+            Response::builder().status(422).body(Body::empty())?
+        }
+    })
+}
+
+fn nslock_release_response(
+    outcome: NslockOutcome,
+    mode: NslockReleaseMode,
+) -> Result<Response<Body>> {
+    Ok(match outcome {
+        NslockOutcome::Ok => {
+            let status = match mode {
+                NslockReleaseMode::Commit => 201,
+                NslockReleaseMode::Rollback => 200,
+            };
+            Response::builder().status(status).body(Body::empty())?
+        }
+        NslockOutcome::InvalidOwner => Response::builder()
+            .status(400)
+            .body(Body::from("invalid owner\n"))?,
+        NslockOutcome::NotLocked => Response::builder()
+            .status(422)
+            .body(Body::from("namespace is not locked"))?,
+        NslockOutcome::OwnedByOther(owner) => Response::builder()
+            .status(422)
+            .header("x-lock-owner", &owner)
+            .body(Body::from("namespace is locked by another owner"))?,
+        NslockOutcome::Gone => Response::builder()
+            .status(410)
+            .body(Body::from("lock is gone"))?,
+        NslockOutcome::AlreadyHeldBySelf => {
+            unreachable!("release_nslock never returns AlreadyHeldBySelf")
+        }
+    })
 }
 
 #[derive(Deserialize)]
@@ -206,50 +216,8 @@ pub struct AdminDeleteUnreferencedContentInNamespaceRequest {
 
 impl Server {
     pub async fn open(config: ServerConfig) -> Result<Arc<Self>> {
-        let db = Database::new(Some(config.cluster.as_str()))
-            .with_context(|| "cannot open fdb cluster")?;
-        let raw_data_prefix = config.raw_data_prefix.as_bytes().to_vec();
-
-        // Read DR replica UID
-        let replica_manager = if config.read_only {
-            Some(ReplicaManager::new(&db, &config.dr_tag).await?)
-        } else {
-            None
-        };
-        Ok(Arc::new(Self {
-            db,
-            key_codec: Arc::new(KeyCodec {
-                raw_data_prefix,
-                metadata_prefix: config.metadata_prefix,
-            }),
-            nskey_cache: Cache::builder()
-                .time_to_live(Duration::from_secs(120))
-                .time_to_idle(Duration::from_secs(5))
-                .max_capacity(10000)
-                .build(),
-            // FDB read versions are valid for 5 seconds.
-            // We conservatively cache them for only 2 seconds here. If for some reason
-            // these versions still lived too long, FDB will error and the client will retry.
-            read_version_cache: Cache::builder()
-                .time_to_live(Duration::from_secs(2))
-                .max_capacity(1000)
-                .build(),
-            read_version_and_nsid_to_lwv_cache: Cache::builder()
-                .time_to_idle(Duration::from_secs(2))
-                .build(),
-            replica_manager,
-            ns_metadata_cache: NamespaceMetadataCache::new(),
-            content_cache: if config.content_cache_size > 0 {
-                Some(
-                    Cache::builder()
-                        .max_capacity(config.content_cache_size as u64)
-                        .build(),
-                )
-            } else {
-                None
-            },
-            auto_create_ns: config.auto_create_ns,
-        }))
+        let core = Core::open(config).await?;
+        Ok(Arc::new(Self { core }))
     }
 
     pub async fn serve_admin_api(
@@ -268,59 +236,6 @@ impl Server {
         }
     }
 
-    async fn create_namespace(
-        &self,
-        key: &str,
-        overlay_base: Option<NamespaceOverlayBase>,
-    ) -> Result<()> {
-        let nskey_key = self.key_codec.construct_nskey_key(&key);
-        let nsmd = NamespaceMetadata {
-            lock: None,
-            overlay_base,
-        };
-        if let Some(base) = &nsmd.overlay_base {
-            decode_version(&base.ns_id).with_context(|| "overlay_base: invalid ns_id")?;
-            decode_version(&base.snapshot_version)
-                .with_context(|| "overlay_base: invalid snapshot_version")?;
-        }
-        let nsmd = serde_json::to_string(&nsmd)?;
-        let mut txn = self.db.create_trx()?;
-
-        loop {
-            if txn.get(&nskey_key, false).await?.is_some() {
-                return Err(anyhow::Error::new(CreateNamespaceError::AlreadyExist));
-            }
-
-            let nsmd_atomic_op_key = generate_suffix_versionstamp_atomic_op(
-                &self.key_codec.construct_nsmd_key([0u8; 10]),
-            );
-            let nskey_atomic_op_value = [0u8; 14];
-            txn.atomic_op(
-                &nsmd_atomic_op_key,
-                nsmd.as_bytes(),
-                MutationType::SetVersionstampedKey,
-            );
-            txn.atomic_op(
-                &nskey_key,
-                &nskey_atomic_op_value,
-                MutationType::SetVersionstampedValue,
-            );
-            match txn.commit().await {
-                Ok(_) => {
-                    return Ok(());
-                }
-                Err(e) => {
-                    txn = match e.on_error().await {
-                        Ok(x) => x,
-                        Err(e) => {
-                            return Err(e.into());
-                        }
-                    };
-                }
-            }
-        }
-    }
-
     async fn do_serve_admin_api(self: Arc<Self>, mut req: Request<Body>) -> Result<Response<Body>> {
         let uri = req.uri();
         let res: Response<Body>;
@@ -328,7 +243,7 @@ impl Server {
             "/api/create_namespace" => {
                 let body = read_full_body_with_limit(req.body_mut()).await?;
                 let body: AdminCreateNamespaceRequest = serde_json::from_slice(&body)?;
-                match self.create_namespace(&body.key, body.overlay_base).await {
+                match self.core.create_namespace(&body.key, body.overlay_base).await {
                     Ok(_) => {
                         return Ok(Response::builder()
                             .status(201)
@@ -352,10 +267,10 @@ impl Server {
             "/api/rename_namespace" => {
                 let body = read_full_body_with_limit(req.body_mut()).await?;
                 let body: AdminRenameNamespaceRequest = serde_json::from_slice(&body)?;
-                let old_nskey_key = self.key_codec.construct_nskey_key(&body.old_key);
-                let new_nskey_key = self.key_codec.construct_nskey_key(&body.new_key);
+                let old_nskey_key = self.core.key_codec.construct_nskey_key(&body.old_key);
+                let new_nskey_key = self.core.key_codec.construct_nskey_key(&body.new_key);
 
-                let mut txn = self.db.create_trx()?;
+                let mut txn = self.core.db.create_trx()?;
 
                 loop {
                     if txn.get(&new_nskey_key, false).await?.is_some() {
@@ -397,9 +312,9 @@ impl Server {
             "/api/delete_namespace" => {
                 let body = read_full_body_with_limit(req.body_mut()).await?;
                 let body: AdminDeleteNamespaceRequest = serde_json::from_slice(&body)?;
-                let nskey_key = self.key_codec.construct_nskey_key(&body.key);
+                let nskey_key = self.core.key_codec.construct_nskey_key(&body.key);
 
-                let mut txn = self.db.create_trx()?;
+                let mut txn = self.core.db.create_trx()?;
 
                 loop {
                     let ns_id = match txn.get(&nskey_key, false).await? {
@@ -412,14 +327,14 @@ impl Server {
                     };
                     let ns_id =
                         <[u8; 10]>::try_from(&ns_id[..]).with_context(|| "cannot parse ns_id")?;
-                    let ns_data_start = self.key_codec.construct_ns_data_prefix(ns_id);
+                    let ns_data_start = self.core.key_codec.construct_ns_data_prefix(ns_id);
                     let mut ns_data_end = ns_data_start.clone();
                     ns_data_end.push(0xff).unwrap();
 
                     txn.clear_range(&ns_data_start, &ns_data_end);
                     txn.clear(&nskey_key);
 
-                    let nsmd_key = self.key_codec.construct_nsmd_key(ns_id);
+                    let nsmd_key = self.core.key_codec.construct_nsmd_key(ns_id);
                     txn.clear(&nsmd_key);
                     txn.update_metadata_version();
                     match txn.commit().await {
@@ -446,9 +361,9 @@ impl Server {
             "/api/truncate_namespace" => {
                 let body = read_full_body_with_limit(req.body_mut()).await?;
                 let body: AdminTruncateNamespaceRequest = serde_json::from_slice(&body)?;
-                let nskey_key = self.key_codec.construct_nskey_key(&body.key);
+                let nskey_key = self.core.key_codec.construct_nskey_key(&body.key);
 
-                let txn = self.db.create_trx()?;
+                let txn = self.core.db.create_trx()?;
                 let ns_id = match txn.get(&nskey_key, false).await? {
                     Some(v) => v,
                     None => {
@@ -521,9 +436,9 @@ impl Server {
                 let body = read_full_body_with_limit(req.body_mut()).await?;
                 let body: AdminDeleteUnreferencedContentInNamespaceRequest =
                     serde_json::from_slice(&body)?;
-                let nskey_key = self.key_codec.construct_nskey_key(&body.key);
+                let nskey_key = self.core.key_codec.construct_nskey_key(&body.key);
 
-                let txn = self.db.create_trx()?;
+                let txn = self.core.db.create_trx()?;
                 let ns_id = match txn.get(&nskey_key, false).await? {
                     Some(v) => v,
                     None => {
@@ -599,8 +514,8 @@ impl Server {
                     .unwrap_or_else(HashMap::new);
 
                 let text_prefix = query.get("prefix").map(|x| x.as_str()).unwrap_or_default();
-                let start = self.key_codec.construct_nskey_key(text_prefix);
-                let key_prefix = self.key_codec.construct_nskey_prefix();
+                let start = self.core.key_codec.construct_nskey_key(text_prefix);
+                let key_prefix = self.core.key_codec.construct_nskey_prefix();
                 let mut cursor = start.clone();
                 let mut end = start.clone();
                 *end.last_mut().unwrap() = 0xff;
@@ -611,7 +526,7 @@ impl Server {
 
                 tokio::spawn(async move {
                     'outer: loop {
-                        let mut txn = match me.db.create_trx() {
+                        let mut txn = match me.core.db.create_trx() {
                             Ok(txn) => txn,
                             Err(e) => {
                                 tracing::error!(error = %e, "create_trx failed");
@@ -700,7 +615,7 @@ impl Server {
 
     async fn globaltask_timekeeper(self: Arc<Self>) {
         let mut lock = DistributedLock::new(
-            self.key_codec.construct_globaltask_key("timekeeper"),
+            self.core.key_codec.construct_globaltask_key("timekeeper"),
             "timekeeper".into(),
         );
         'outer: loop {
@@ -708,7 +623,7 @@ impl Server {
                 let me = self.clone();
                 match lock
                     .lock(
-                        move || me.db.create_trx().with_context(|| "failed to create txn"),
+                        move || me.core.db.create_trx().with_context(|| "failed to create txn"),
                         Duration::from_secs(5),
                     )
                     .await
@@ -726,7 +641,7 @@ impl Server {
 
             loop {
                 loop {
-                    let txn = match lock.create_txn_and_check_sync(&self.db).await {
+                    let txn = match lock.create_txn_and_check_sync(&self.core.db).await {
                         Ok(x) => x,
                         Err(e) => {
                             tracing::error!(error = %e, "timekeeper create_txn_and_check_sync error");
@@ -738,7 +653,7 @@ impl Server {
                         .duration_since(SystemTime::UNIX_EPOCH)
                         .unwrap()
                         .as_secs();
-                    let key = self.key_codec.construct_time2version_key(now);
+                    let key = self.core.key_codec.construct_time2version_key(now);
                     let value = [0u8; 14];
                     txn.atomic_op(&key, &value, MutationType::SetVersionstampedValue);
                     match txn.commit().await {
@@ -756,70 +671,6 @@ impl Server {
 
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
-        }
-    }
-
-    async fn lookup_nskey(&self, nskey: &str, hashproof: Option<&str>) -> Result<Option<[u8; 10]>> {
-        let hashproof_hash = {
-            let segs = nskey.split(":").collect::<Vec<_>>();
-            if segs.len() < 2 {
-                None
-            } else {
-                Some(segs[1])
-            }
-        };
-        if let Some(hashproof_hash) = hashproof_hash {
-            let mut hash: [u8; 32] = [0u8; 32];
-            if hex::decode_to_slice(hashproof_hash, &mut hash).is_err() {
-                tracing::error!(nskey, "hashproof_hash hex decode failed");
-                return Ok(None);
-            }
-            let proof = match hex::decode(hashproof.unwrap_or("")) {
-                Ok(x) => x,
-                Err(_) => {
-                    tracing::error!(nskey, "hashproof hex decode failed");
-                    return Ok(None);
-                }
-            };
-            let hashed_proof = blake3::hash(&proof);
-            if !constant_time_eq::constant_time_eq_n(hashed_proof.as_bytes(), &hash) {
-                tracing::error!(nskey, "hashproof mismatch");
-                return Ok(None);
-            }
-        }
-
-        let res = self
-            .nskey_cache
-            .try_get_with(nskey.to_string(), async {
-                let txn = self.db.create_trx();
-                match txn {
-                    Ok(txn) => {
-                        if self.is_read_only() {
-                            txn.set_option(TransactionOption::ReadLockAware).unwrap();
-                        }
-                        match txn
-                            .get(&self.key_codec.construct_nskey_key(nskey), false)
-                            .await
-                        {
-                            Ok(Some(x)) => <[u8; 10]>::try_from(&x[..])
-                                .with_context(|| "invalid namespace id")
-                                .map_err(GetError::Other),
-                            Ok(None) => Err(GetError::NotFound),
-                            Err(e) => Err(GetError::Other(
-                                anyhow::Error::from(e).context("transaction failed"),
-                            )),
-                        }
-                    }
-                    Err(e) => Err(GetError::Other(
-                        anyhow::Error::from(e).context("transaction creation failed"),
-                    )),
-                }
-            })
-            .await;
-        match res.as_ref().map_err(|e| &**e) {
-            Ok(x) => Ok(Some(*x)),
-            Err(GetError::NotFound) => Ok(None),
-            Err(GetError::Other(x)) => Err(anyhow::anyhow!("nskey lookup failed: {}", x)),
         }
     }
 
@@ -841,13 +692,13 @@ impl Server {
                 .headers()
                 .get("x-namespace-hashproof")
                 .map(|x| x.to_str().unwrap_or_default());
-            let ns_id = self.lookup_nskey(ns_key, hashproof).await?;
+            let ns_id = self.core.lookup_nskey(ns_key, hashproof).await?;
             let ns_id = match ns_id {
                 Some(x) => x,
                 None => {
-                    if self.auto_create_ns {
-                        self.create_namespace(ns_key, None).await?;
-                        self.lookup_nskey(ns_key, None).await?.unwrap()
+                    if self.core.auto_create_ns {
+                        self.core.create_namespace(ns_key, None).await?;
+                        self.core.lookup_nskey(ns_key, None).await?.unwrap()
                     } else {
                         return Ok(Response::builder()
                             .status(404)
@@ -885,41 +736,6 @@ impl Server {
         }
     }
 
-    async fn create_versioned_read_txn(&self, version: &str) -> Result<Transaction> {
-        let version = decode_version(version)?;
-        let txn = self.db.create_trx()?;
-        if self.is_read_only() {
-            txn.set_option(TransactionOption::ReadLockAware).unwrap();
-        }
-
-        // It's safe to set CRR here. We do our own version check below.
-        txn.set_option(TransactionOption::CausalReadRisky).unwrap();
-
-        let mut grv_called = false;
-        let fdb_rv = self
-            .read_version_cache
-            .try_get_with(version, async {
-                grv_called = true;
-                let fdb_rv = txn.get_read_version().await;
-                match fdb_rv {
-                    Ok(fdb_rv) => {
-                        // XXX: We are only checking for primary read here due to performance reasons
-                        if !self.is_read_only() && fdb_rv < i64::from_be_bytes(<[u8; 8]>::try_from(&version[0..8]).unwrap()) {
-                            Err(anyhow::anyhow!("fdb read version older than requested version - causal read fault?"))
-                        } else {
-                            Ok(fdb_rv)
-                        }
-                    },
-                    Err(e) => Err(anyhow::Error::from(e))
-                }
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("cannot get read version: {}", e))?;
-        if !grv_called {
-            txn.set_read_version(fdb_rv);
-        }
-        Ok(txn)
-    }
 
     async fn do_serve_data_plane_stage2(
         self: Arc<Self>,
@@ -963,7 +779,7 @@ impl Server {
                     .get("lock_owner")
                     .map(|x| x.as_str())
                     .unwrap_or_default();
-                let stat = self.stat(ns_id, from_version, crr, lock_owner).await?;
+                let stat = self.core.stat(ns_id, from_version, crr, lock_owner).await?;
                 let stat =
                     serde_json::to_vec(&stat).with_context(|| "cannot serialize stat response")?;
 
@@ -1054,7 +870,7 @@ impl Server {
                 });
             }
             "/batch/write" => {
-                if self.is_read_only() {
+                if self.core.is_read_only() {
                     return Ok(Response::builder().status(403).body(Body::empty()).unwrap());
                 }
 
@@ -1080,7 +896,7 @@ impl Server {
                 });
             }
             "/batch/commit" => {
-                if self.is_read_only() {
+                if self.core.is_read_only() {
                     return Ok(Response::builder().status(403).body(Body::empty()).unwrap());
                 }
 
@@ -1133,7 +949,7 @@ impl Server {
                     total_page_count += init.num_pages as usize;
 
                     let ns_id = match self
-                        .lookup_nskey(init.ns_key, init.ns_key_hashproof)
+                        .core.lookup_nskey(init.ns_key, init.ns_key_hashproof)
                         .await?
                     {
                         Some(x) => x,
@@ -1198,7 +1014,7 @@ impl Server {
                 }
 
                 match self
-                    .commit(CommitContext {
+                    .core.commit(CommitContext {
                         idempotency_key,
                         allow_skip_idempotency_check: commit_global_init
                             .allow_skip_idempotency_check,
@@ -1250,9 +1066,9 @@ impl Server {
                     .parse::<u64>()
                     .with_context(|| "invalid t")?;
 
-                let txn = self.db.create_trx()?;
+                let txn = self.core.db.create_trx()?;
 
-                if self.is_read_only() {
+                if self.core.is_read_only() {
                     txn.set_option(TransactionOption::ReadLockAware).unwrap();
                 }
 
@@ -1262,9 +1078,9 @@ impl Server {
 
                 let ttv_res = time2version(
                     &txn,
-                    &self.key_codec,
+                    &self.core.key_codec,
                     time_in_seconds,
-                    self.replica_manager.as_ref(),
+                    self.core.replica_manager.as_ref(),
                 )
                 .await?;
                 let body = serde_json::to_vec(&ttv_res)
@@ -1283,15 +1099,16 @@ impl Server {
 
                 let body = read_full_body_with_limit(req.into_body()).await?;
                 let body: NslockAcquireRequest = serde_json::from_slice(&body)?;
-                res = acquire_nslock(
-                    &self.db,
-                    &self.key_codec,
-                    &self.ns_metadata_cache,
+                let outcome = acquire_nslock(
+                    &self.core.db,
+                    &self.core.key_codec,
+                    &self.core.ns_metadata_cache,
                     ns_id,
                     body.owner,
                     body.version,
                 )
                 .await?;
+                res = nslock_acquire_response(outcome)?;
             }
             "/nslock/release" => {
                 let (ns_id, _) = match require_ns_id() {
@@ -1301,15 +1118,16 @@ impl Server {
 
                 let body = read_full_body_with_limit(req.into_body()).await?;
                 let body: NslockReleaseRequest = serde_json::from_slice(&body)?;
-                res = release_nslock(
-                    &self.db,
-                    &self.key_codec,
-                    &self.ns_metadata_cache,
+                let outcome = release_nslock(
+                    &self.core.db,
+                    &self.core.key_codec,
+                    &self.core.ns_metadata_cache,
                     ns_id,
                     body.owner,
                     body.mode,
                 )
                 .await?;
+                res = nslock_release_response(outcome, body.mode)?;
             }
             _ => {
                 res = Response::builder().status(404).body("not found".into())?;
@@ -1329,9 +1147,9 @@ impl Server {
         let reader = DeltaReader {
             txn: &txn,
             ns_id,
-            key_codec: &self.key_codec,
-            replica_manager: self.replica_manager.as_ref(),
-            content_cache: self.content_cache.as_ref(),
+            key_codec: &self.core.key_codec,
+            replica_manager: self.core.replica_manager.as_ref(),
+            content_cache: self.core.content_cache.as_ref(),
         };
         let (version, hash) = match reader
             .read_page_hash(page_index, Some(page_version_hex), true)
@@ -1347,10 +1165,6 @@ impl Server {
         Ok(Some(Page { version, data }))
     }
 
-    pub fn is_read_only(&self) -> bool {
-        self.replica_manager.is_some()
-    }
-
     async fn batch_write(
         &self,
         ns_id: [u8; 10],
@@ -1361,7 +1175,7 @@ impl Server {
         >,
         mut res_sender: Sender,
     ) -> Result<()> {
-        let txn = self.db.create_trx()?;
+        let txn = self.core.db.create_trx()?;
 
         // It's safe to set CRR for the write path. Seeing stale data doesn't affect correctness.
         txn.set_option(TransactionOption::CausalReadRisky).unwrap();
@@ -1396,9 +1210,9 @@ impl Server {
         let mut applier = WriteApplier::new(WriteApplierContext {
             txn: &txn,
             ns_id,
-            key_codec: &self.key_codec,
+            key_codec: &self.core.key_codec,
             now,
-            content_cache: self.content_cache.as_ref(),
+            content_cache: self.core.content_cache.as_ref(),
         });
         let res = applier.apply_write(&write_reqs).await;
         let res = match res {
@@ -1448,9 +1262,9 @@ impl Server {
                 hash = hex::encode(hash),
                 "entering read-your-writes logic"
             );
-            txn = self.db.create_trx()?;
+            txn = self.core.db.create_trx()?;
 
-            if self.is_read_only() {
+            if self.core.is_read_only() {
                 txn.set_option(TransactionOption::ReadLockAware).unwrap();
             }
 
@@ -1459,9 +1273,9 @@ impl Server {
             let reader = DeltaReader {
                 txn: &txn,
                 ns_id,
-                key_codec: &self.key_codec,
-                replica_manager: self.replica_manager.as_ref(),
-                content_cache: self.content_cache.as_ref(),
+                key_codec: &self.core.key_codec,
+                replica_manager: self.core.replica_manager.as_ref(),
+                content_cache: self.core.content_cache.as_ref(),
             };
             let content = reader
                 .get_page_content_decoded_snapshot_compressed(hash)
@@ -1478,7 +1292,7 @@ impl Server {
             // The normal path.
 
             txn = self
-                .create_versioned_read_txn(read_req.version)
+                .core.create_versioned_read_txn(read_req.version)
                 .await
                 .with_context(|| "failed to create versioned read txn")?;
             let mut page = self
@@ -1494,8 +1308,8 @@ impl Server {
             if page.is_none() {
                 // Overlay
                 let metadata = self
-                    .ns_metadata_cache
-                    .get(&txn, &self.key_codec, ns_id)
+                    .core.ns_metadata_cache
+                    .get(&txn, &self.core.key_codec, ns_id)
                     .await?;
                 if let Some(base) = &metadata.overlay_base {
                     let base_ns_id = decode_version(&base.ns_id)?;
