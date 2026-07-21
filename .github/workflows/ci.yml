@@ -181,6 +181,40 @@ jobs:
         with:
           name: deb
           path: ./deb
+  pgtypes-ext:
+    name: mvsqlite_pgtypes extension
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          set -e
+          sudo apt update && sudo apt install -y sqlite3
+      - name: Build extension
+        run: make -C ./mvsqlite-pgtypes-ext build
+      - name: Smoke test
+        run: |
+          set -e
+          uuid1=$(sqlite3 :memory: -cmd ".load ./mvsqlite-pgtypes-ext/libmvsqlite_pgtypes" "SELECT uuid();")
+          roundtrip=$(sqlite3 :memory: -cmd ".load ./mvsqlite-pgtypes-ext/libmvsqlite_pgtypes" "SELECT uuid_str(uuid_blob('$uuid1'));")
+          echo "uuid1=$uuid1 roundtrip=$roundtrip"
+          if [ "$uuid1" != "$roundtrip" ]; then
+            echo "uuid round-trip mismatch"
+            exit 1
+          fi
+          sum=$(sqlite3 :memory: -cmd ".load ./mvsqlite-pgtypes-ext/libmvsqlite_pgtypes" "SELECT decimal_add('1.10', '2.25');")
+          echo "decimal_add('1.10','2.25')=$sum"
+          if [ "$sum" != "3.35" ]; then
+            echo "decimal_add gave wrong exact result: $sum"
+            exit 1
+          fi
+          series=$(sqlite3 :memory: -cmd ".load ./mvsqlite-pgtypes-ext/libmvsqlite_pgtypes" "SELECT group_concat(value) FROM generate_series(1,5);")
+          echo "generate_series(1,5)=$series"
+          if [ "$series" != "1,2,3,4,5" ]; then
+            echo "generate_series gave wrong result: $series"
+            exit 1
+          fi
   stress:
     name: mvstore stress test
     runs-on: ubuntu-22.04
