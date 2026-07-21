@@ -11,8 +11,9 @@ enum Mode {
     /// Read the same entity from every shard concurrently and merge - the pattern
     /// used for cross-shard reads (leaderboards, "who's near a boundary").
     ScatterGather,
-    /// Repeatedly move a synthetic entity's authority between two random shards via
-    /// transfer_authority, verifying it lands in exactly one shard afterward.
+    /// Repeatedly move a synthetic row between two random shards via
+    /// commit_across_two_namespaces, verifying it lands in exactly one shard
+    /// afterward.
     Transfer,
 }
 

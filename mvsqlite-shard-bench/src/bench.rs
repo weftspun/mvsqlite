@@ -217,12 +217,12 @@ pub async fn run_transfer(
                     clients[current as usize].create_transaction(None).await,
                     clients[target as usize].create_transaction(None).await,
                 ) {
-                    (Ok(mut from_txn), Ok(mut to_txn)) => {
-                        if from_txn
+                    (Ok(mut source_txn), Ok(mut destination_txn)) => {
+                        if source_txn
                             .write_many(&[(entity_id, encode_tombstone().as_slice())])
                             .await
                             .is_err()
-                            || to_txn
+                            || destination_txn
                                 .write_many(&[(entity_id, encode_owned(target).as_slice())])
                                 .await
                                 .is_err()
@@ -231,7 +231,7 @@ pub async fn run_transfer(
                         }
                         let t0 = Instant::now();
                         let result = clients[current as usize]
-                            .transfer_authority(None, from_txn, to_txn)
+                            .commit_across_two_namespaces(None, source_txn, destination_txn)
                             .await;
                         match result {
                             Ok(CommitOutput::Committed(_)) => {
@@ -254,7 +254,7 @@ pub async fn run_transfer(
         w.await?;
     }
     let elapsed = start.elapsed();
-    stats.report("transfer_authority", elapsed);
+    stats.report("commit_across_two_namespaces", elapsed);
     tracing::info!(
         conflicts = conflicts.load(Ordering::Relaxed),
         "transfer benchmark done"
