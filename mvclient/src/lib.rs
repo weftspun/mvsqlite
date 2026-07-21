@@ -1,7 +1,9 @@
 mod backoff;
+mod temperature;
 
 use anyhow::{Context, Result};
 use backoff::RandomizedExponentialBackoff;
+use temperature::PageTemperatureTracker;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use bytes::Bytes;
 use rand::{Rng, RngCore};
@@ -30,6 +32,7 @@ pub enum CommitError {
 pub struct MultiVersionClient {
     client: reqwest::Client,
     config: MultiVersionClientConfig,
+    page_temperature: PageTemperatureTracker,
 }
 
 #[derive(Clone, Debug)]
@@ -164,7 +167,11 @@ pub struct TimeToVersionPoint {
 
 impl MultiVersionClient {
     pub fn new(config: MultiVersionClientConfig, client: reqwest::Client) -> Result<Arc<Self>> {
-        Ok(Arc::new(Self { client, config }))
+        Ok(Arc::new(Self {
+            client,
+            config,
+            page_temperature: PageTemperatureTracker::default(),
+        }))
     }
 
     pub fn config(&self) -> &MultiVersionClientConfig {
@@ -264,6 +271,23 @@ impl MultiVersionClient {
         let mut idempotency_key: [u8; 16] = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut idempotency_key);
 
+        let touched_pages: Vec<u32> = intents
+            .iter()
+            .flat_map(|intent| intent.requests.iter().map(|req| req.page_index))
+            .collect();
+
+        // Best-effort, purely local pacing: if pages this commit is about to touch
+        // have recently caused conflicts for this client, wait a small jittered amount
+        // before sending, reducing the odds of colliding with another concurrent
+        // committer on the same hot pages at the exact same instant. Zero cost when
+        // nothing's hot.
+        let suggested_backoff = self
+            .page_temperature
+            .suggested_backoff(touched_pages.iter().copied());
+        if suggested_backoff > Duration::ZERO {
+            tokio::time::sleep(suggested_backoff).await;
+        }
+
         let mut boff = RandomizedExponentialBackoff::default();
         let mut allow_skip_idempotency_check = true; // only for the first attempt
 
@@ -307,6 +331,8 @@ impl MultiVersionClient {
                 }
                 Err(status) => {
                     if status.as_u16() == 409 {
+                        self.page_temperature
+                            .record_conflict(touched_pages.iter().copied());
                         return Ok(None);
                     }
                     return Err(CommitError::Status(status).into());
@@ -318,6 +344,8 @@ impl MultiVersionClient {
                 .with_context(|| format!("missing committed version header"))?
                 .to_str()?;
             tracing::debug!(version = committed_version, "committed transaction");
+            self.page_temperature
+                .record_success(touched_pages.iter().copied());
             return Ok(Some(CommitResult {
                 version: committed_version.into(),
                 duration: start_time.elapsed(),
