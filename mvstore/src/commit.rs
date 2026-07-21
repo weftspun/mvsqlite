@@ -15,9 +15,10 @@ use rand::RngCore;
 
 use crate::{
     delta::reader::DeltaReader,
+    keys::LWV_SHARD_COUNT,
     server::Server,
     util::{decode_version, generate_suffix_versionstamp_atomic_op, GoneError},
-    util::{get_txn_read_version_as_versionstamp, ContentIndex},
+    util::{get_last_write_version, get_txn_read_version_as_versionstamp, ContentIndex},
     write::{WriteApplier, WriteApplierContext, WriteRequest},
 };
 
@@ -208,47 +209,70 @@ impl Server {
 
             let plcc_enable_ns = plcc_enable && ns.use_read_set;
 
-            // Idempotency & non-plcc conflict check
+            // Idempotency check & non-PLCC (database-level) conflict check.
+            //
+            // These used to be one read/write against a single shared per-namespace key,
+            // which made that key a write hot-spot under concurrent commits regardless of
+            // whether PLCC was in use. They are now two independent, non-contended paths:
+            //
+            // - Idempotency is a point lookup keyed by the (random, per-commit) idempotency
+            //   key itself, so it's never hot.
+            // - The LWV comparison, when needed, reads the max version across
+            //   `LWV_SHARD_COUNT` shard keys instead of one, spreading write load across
+            //   shards while still seeing every commit regardless of which shard it landed on.
             {
-                let last_write_version_key =
-                    self.key_codec.construct_last_write_version_key(ns.ns_id);
-
-                // We need to go through the read-lwv path in the following cases:
-                //
-                // - This is not a PLCC commit. Database-level conflict check works by comparing LWV.
-                // - The client does not allow us to skip idempotency check. This happens when the client is retrying a commit.
-                if !plcc_enable_ns || !ctx.allow_skip_idempotency_check {
-                    // If we rely on PLCC to check conflicts, it is not necessary to add LWV to conflict set.
-                    let actual_lwv_value = txn.get(&last_write_version_key, plcc_enable_ns).await?;
-
-                    if let Some(t) = actual_lwv_value {
-                        if t.len() == 16 + 10 {
-                            let actual_idempotency_token = <[u8; 16]>::try_from(&t[0..16]).unwrap();
-                            let actual_last_write_version =
-                                <[u8; 10]>::try_from(&t[16..26]).unwrap();
-                            if actual_idempotency_token == ctx.idempotency_key {
-                                // This is an idempotent retry - return conservative values
-                                return Ok(CommitResult::Committed {
-                                    versionstamp: actual_last_write_version,
-                                    changelog: HashMap::new(),
-                                });
-                            }
-
-                            if ns.client_assumed_version < actual_last_write_version {
-                                if !plcc_enable_ns {
-                                    return Ok(CommitResult::Conflict);
-                                }
-                            }
+                // The client does not allow us to skip idempotency check. This happens when
+                // the client is retrying a commit.
+                if !ctx.allow_skip_idempotency_check {
+                    let idempotency_key = self
+                        .key_codec
+                        .construct_idempotency_key(ns.ns_id, ctx.idempotency_key);
+                    if let Some(t) = txn.get(&idempotency_key, false).await? {
+                        if let Ok(ci) = ContentIndex::decode(&t) {
+                            // This is an idempotent retry - return conservative values
+                            return Ok(CommitResult::Committed {
+                                versionstamp: ci.versionstamp,
+                                changelog: HashMap::new(),
+                            });
                         }
                     }
                 }
 
-                let mut new_lwv_value = [0u8; 16 + 10 + 4];
-                new_lwv_value[0..16].copy_from_slice(&ctx.idempotency_key);
-                new_lwv_value[26..30].copy_from_slice(&16u32.to_le_bytes()[..]);
+                // This is not a PLCC commit. Database-level conflict check works by comparing
+                // against the max version across all LWV shards.
+                if !plcc_enable_ns {
+                    let actual_last_write_version =
+                        get_last_write_version(&txn, &self.key_codec, ns.ns_id, false).await?;
+                    if ns.client_assumed_version < actual_last_write_version {
+                        return Ok(CommitResult::Conflict);
+                    }
+                }
+
+                // Always record this commit's version, regardless of PLCC state, so that:
+                // (a) a future retry with this idempotency key can be detected, and
+                // (b) a future non-PLCC commit's LWV comparison sees this write.
+                //
+                // The idempotency record uses the same [time_secs(8) | versionstamp(10)]
+                // encoding as ContentIndex, so it can be GC'd by age the same way.
+                let idempotency_key = self
+                    .key_codec
+                    .construct_idempotency_key(ns.ns_id, ctx.idempotency_key);
+                let idempotency_atomic_op_payload = ContentIndex::generate_mutation_payload(now);
                 txn.atomic_op(
-                    &last_write_version_key,
-                    &new_lwv_value,
+                    &idempotency_key,
+                    &idempotency_atomic_op_payload,
+                    MutationType::SetVersionstampedValue,
+                );
+
+                // The LWV shard just needs the bare version — a 10-byte versionstamp
+                // placeholder plus a 4-byte LE offset (=0) telling FDB where to fill it in.
+                let mut lwv_value = [0u8; 10 + 4];
+                lwv_value[10..14].copy_from_slice(&0u32.to_le_bytes());
+                let lwv_shard = ctx.idempotency_key[0] % LWV_SHARD_COUNT;
+                let lwv_shard_key = self.key_codec.construct_lwv_shard_key(ns.ns_id, lwv_shard);
+                txn.atomic_op(
+                    &lwv_shard_key,
+                    &lwv_value,
                     MutationType::SetVersionstampedValue,
                 );
             }

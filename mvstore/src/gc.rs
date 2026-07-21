@@ -468,6 +468,86 @@ impl Server {
             }
         }
 
+        // Step 4: GC expired idempotency records.
+        //
+        // These only need to live long enough for a legitimate retry to still find them;
+        // past the same freshness TTL used for content-index entries, they're dead weight.
+        {
+            let scan_start = self.key_codec.construct_idempotency_scan_start(ns_id);
+            let scan_end = self.key_codec.construct_idempotency_scan_end(ns_id);
+            let mut scan_cursor = scan_start.clone();
+            let mut count = 0usize;
+
+            loop {
+                let txn = lock.create_txn_and_check_sync(&self.db).await?;
+                let scan_result: Vec<_> = match txn
+                    .get_ranges_keyvalues(
+                        RangeOption {
+                            limit: Some(GC_SCAN_BATCH_SIZE.load(Ordering::Relaxed)),
+                            reverse: false,
+                            mode: StreamingMode::WantAll,
+                            ..RangeOption::from(scan_cursor.as_slice()..=scan_end.as_slice())
+                        },
+                        true,
+                    )
+                    .try_collect()
+                    .await
+                {
+                    Ok(x) => x,
+                    Err(e) => {
+                        txn.on_error(e).await?;
+                        continue;
+                    }
+                };
+
+                if scan_result.is_empty() {
+                    break;
+                }
+
+                let mut next_scan_cursor =
+                    FixedKeyVec::from_slice(scan_result.last().unwrap().key()).unwrap();
+                next_scan_cursor.push(0x00).unwrap();
+
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap();
+                let mut delete_queue: Vec<Vec<u8>> = vec![];
+                for kv in &scan_result {
+                    let ci = match ContentIndex::decode(kv.value()) {
+                        Ok(x) => x,
+                        Err(_) => continue,
+                    };
+                    let their_secs = ci.time.as_secs();
+                    let our_secs = now.as_secs();
+                    if their_secs > our_secs
+                        || our_secs - their_secs < GC_FRESH_PAGE_TTL_SECS.load(Ordering::Relaxed)
+                    {
+                        continue;
+                    }
+                    delete_queue.push(kv.key().to_vec());
+                }
+                drop(scan_result);
+
+                if !delete_queue.is_empty() {
+                    if !dry_run {
+                        for key in &delete_queue {
+                            txn.clear(key);
+                        }
+                        match txn.commit().await {
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to commit idempotency GC clear, skipping");
+                            }
+                        }
+                    }
+                    count += delete_queue.len();
+                    progress_callback(format!("idempotency:{}\n", count));
+                }
+
+                scan_cursor = next_scan_cursor;
+            }
+        }
+
         progress_callback(format!("DONE\n"));
         Ok(())
     }

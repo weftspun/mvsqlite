@@ -2,6 +2,10 @@ use foundationdb::tuple::pack;
 
 use crate::fixed::FixedKeyVec;
 
+/// Number of shards the last-write-version indicator is split across, to avoid a
+/// single hot key being written by every commit in a namespace.
+pub const LWV_SHARD_COUNT: u8 = 16;
+
 pub struct KeyCodec {
     pub metadata_prefix: String,
     pub raw_data_prefix: Vec<u8>,
@@ -60,12 +64,50 @@ impl KeyCodec {
         key
     }
 
+    /// Legacy, unsharded last-write-version key. No longer written by `commit()` —
+    /// kept only so old deployments can still be inspected/migrated.
     pub fn construct_last_write_version_key(&self, ns_id: [u8; 10]) -> FixedKeyVec {
         let mut buf = FixedKeyVec::new();
         buf.extend_from_slice(&self.raw_data_prefix).unwrap();
         buf.extend_from_slice(&ns_id).unwrap();
         buf.push(b'v').unwrap();
         buf
+    }
+
+    /// One of `LWV_SHARD_COUNT` shards of the last-write-version indicator. Value is a
+    /// plain 10-byte version (no idempotency payload — see `construct_idempotency_key`).
+    pub fn construct_lwv_shard_key(&self, ns_id: [u8; 10], shard: u8) -> FixedKeyVec {
+        let mut buf = FixedKeyVec::new();
+        buf.extend_from_slice(&self.raw_data_prefix).unwrap();
+        buf.extend_from_slice(&ns_id).unwrap();
+        buf.push(b'w').unwrap();
+        buf.push(shard).unwrap();
+        buf
+    }
+
+    /// Idempotency record for one commit attempt, keyed by the client-supplied
+    /// idempotency key itself (uniformly random, so this keyspace is never hot).
+    /// Value is the same [time_secs(8) | versionstamp(10)] encoding as ContentIndex,
+    /// so it can be GC'd by age.
+    pub fn construct_idempotency_key(
+        &self,
+        ns_id: [u8; 10],
+        idempotency_key: [u8; 16],
+    ) -> FixedKeyVec {
+        let mut buf = FixedKeyVec::new();
+        buf.extend_from_slice(&self.raw_data_prefix).unwrap();
+        buf.extend_from_slice(&ns_id).unwrap();
+        buf.push(b'i').unwrap();
+        buf.extend_from_slice(&idempotency_key).unwrap();
+        buf
+    }
+
+    pub fn construct_idempotency_scan_start(&self, ns_id: [u8; 10]) -> FixedKeyVec {
+        self.construct_idempotency_key(ns_id, [0u8; 16])
+    }
+
+    pub fn construct_idempotency_scan_end(&self, ns_id: [u8; 10]) -> FixedKeyVec {
+        self.construct_idempotency_key(ns_id, [0xffu8; 16])
     }
 
     pub fn construct_ns_data_prefix(&self, ns_id: [u8; 10]) -> FixedKeyVec {

@@ -2,9 +2,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use foundationdb::{options::ConflictRangeType, FdbError, Transaction};
+use futures::stream::FuturesOrdered;
+use futures::StreamExt;
 use thiserror::Error;
 
-use crate::keys::KeyCodec;
+use crate::keys::{KeyCodec, LWV_SHARD_COUNT};
 
 pub async fn get_txn_read_version_as_versionstamp(txn: &Transaction) -> Result<[u8; 10]> {
     let read_version = txn.get_read_version().await? as u64;
@@ -69,17 +71,29 @@ pub fn add_single_key_read_conflict_range(txn: &Transaction, key: &[u8]) -> Resu
     Ok(())
 }
 
+/// Returns the maximum version across all last-write-version shards, i.e. the version
+/// of the most recent commit to this namespace, regardless of which shard it landed on.
 pub async fn get_last_write_version(
     txn: &Transaction,
     key_codec: &KeyCodec,
     ns_id: [u8; 10],
     snapshot: bool,
 ) -> Result<[u8; 10], FdbError> {
+    let mut futs = FuturesOrdered::new();
+    for shard in 0..LWV_SHARD_COUNT {
+        let key = key_codec.construct_lwv_shard_key(ns_id, shard);
+        futs.push_back(async move { txn.get(&key, snapshot).await });
+    }
+
     let mut version = [0u8; 10];
-    let last_write_version_key = key_codec.construct_last_write_version_key(ns_id);
-    if let Some(t) = txn.get(&last_write_version_key, snapshot).await? {
-        if t.len() == 16 + 10 {
-            version = <[u8; 10]>::try_from(&t[16..26]).unwrap();
+    while let Some(res) = futs.next().await {
+        if let Some(t) = res? {
+            if t.len() == 10 {
+                let shard_version = <[u8; 10]>::try_from(&t[..]).unwrap();
+                if shard_version > version {
+                    version = shard_version;
+                }
+            }
         }
     }
 

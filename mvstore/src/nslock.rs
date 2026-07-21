@@ -5,7 +5,7 @@ use std::sync::{
 
 use crate::{
     fixed::FixedKeyVec,
-    keys::KeyCodec,
+    keys::{KeyCodec, LWV_SHARD_COUNT},
     metadata::{NamespaceLock, NamespaceMetadataCache},
     util::{
         decode_version, extract_10_byte_suffix, extract_beu32_suffix, get_last_write_version,
@@ -252,13 +252,22 @@ pub async fn release_nslock(
                 .body(Body::from("lock is gone"))?);
         }
 
-        // Patch LWV
+        // Patch LWV: reset every shard to the rollback target version, so a future
+        // non-PLCC commit's max-over-shards comparison reflects the rollback and not a
+        // stale higher version left behind on some other shard.
         {
-            let last_write_version_key = key_codec.construct_last_write_version_key(ns_id);
+            for shard in 0..LWV_SHARD_COUNT {
+                let lwv_shard_key = key_codec.construct_lwv_shard_key(ns_id, shard);
+                txn.set(&lwv_shard_key, &snapshot_version);
+            }
+        }
 
-            let mut new_lwv_value = [0u8; 16 + 10];
-            new_lwv_value[16..26].copy_from_slice(&snapshot_version);
-            txn.set(&last_write_version_key, &new_lwv_value);
+        // Invalidate idempotency records: a retry matching a commit that's since been
+        // rolled back away must not be served the pre-rollback cached result.
+        {
+            let start = key_codec.construct_idempotency_scan_start(ns_id);
+            let end = key_codec.construct_idempotency_scan_end(ns_id);
+            txn.clear_range(start.as_slice(), end.as_slice());
         }
 
         // Delete changelog
