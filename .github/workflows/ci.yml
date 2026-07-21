@@ -259,6 +259,29 @@ jobs:
           sudo dpkg -i fdb-client.deb
           curl -L https://github.com/apple/foundationdb/releases/download/7.1.53/foundationdb-server_7.1.53-1_amd64.deb --output fdb-server.deb
           sudo dpkg -i fdb-server.deb
+      - name: Configure multi-process FDB (one fdbserver per core)
+        # FDB's own docs: "The default installation runs only one FoundationDB
+        # server process per machine (which will use only one CPU core)... Most
+        # users will want to maximize performance by running one FoundationDB
+        # server process per core." The earlier version of this job never did
+        # this, so every mvstore process - regardless of shard count - funneled
+        # through one single-core fdbserver, which is the likely reason the
+        # earlier run showed a flat throughput curve across num_shards.
+        run: |
+          set -e
+          NPROC=$(nproc)
+          echo "cores available: $NPROC"
+          for i in $(seq 1 $((NPROC - 1))); do
+            PORT=$((4500 + i))
+            {
+              echo ""
+              echo "[fdbserver.$PORT]"
+            } | sudo tee -a /etc/foundationdb/foundationdb.conf > /dev/null
+          done
+          cat /etc/foundationdb/foundationdb.conf
+          sudo service foundationdb restart
+          sleep 3
+          sudo fdbcli --exec "status" || true
       - name: Fetch binaries
         uses: actions/download-artifact@v4
         with:
