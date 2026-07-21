@@ -115,6 +115,13 @@ jobs:
           curl -L https://github.com/apple/foundationdb/releases/download/7.1.53/foundationdb-clients_7.1.53-1_amd64.deb --output fdb-client.deb
           sudo dpkg -i fdb-client.deb
           sudo apt update && sudo apt install -y libfuse3-dev execstack
+      - name: Build (mvsqlite-shard-bench)
+        # No --locked, and built first: this crate is new, so Cargo.lock needs a new
+        # entry for it - adding a workspace member invalidates --locked for every
+        # crate's build, not just this one's, until the lockfile is brought current.
+        # Its dependencies are otherwise identical to mvstore-stress's, already
+        # resolved, so this can't change any pinned version, only add this entry.
+        run: cargo build --release -p mvsqlite-shard-bench
       - name: Build (mvstore)
         run: cargo build --locked --release -p mvstore
       - name: Build (mvsqlite)
@@ -134,11 +141,6 @@ jobs:
           make build-patched-sqlite3
       - name: Build (mvstore-stress)
         run: cargo build --locked --release -p mvstore-stress
-      - name: Build (mvsqlite-shard-bench)
-        # No --locked: this crate is new, so Cargo.lock needs a new entry for it.
-        # Its dependencies are otherwise identical to mvstore-stress's, already
-        # resolved in the lockfile, so this can't change any pinned version.
-        run: cargo build --release -p mvsqlite-shard-bench
       - name: Collect binaries
         run: |
           set -e
