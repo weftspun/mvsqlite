@@ -8,9 +8,17 @@
  *                  decimal_sum() aggregate, arbitrary precision, no float error
  *   - series.c  -> generate_series(start, stop, step)     (PG generate_series())
  *
- * These are vendored verbatim from https://sqlite.org/src/dir/ext/misc (public
- * domain) rather than reimplemented - they're the reference implementation
- * every project reaching for Postgres-like SQLite types already uses.
+ * uuid.c/decimal.c/series.c are vendored verbatim from
+ * https://sqlite.org/src/dir/ext/misc (public domain) - the reference
+ * implementation every project reaching for Postgres-like SQLite types
+ * already uses.
+ *
+ * ipaddr/extension.{c,h} -> iphost(x), ipmasklen(x), ipnetwork(x),
+ * ipcontains(net, x) (PG/CRDB INET/CIDR type) - vendored from
+ * https://github.com/nalgeon/sqlean (MIT, Copyright (c) 2021 Vincent Bernat),
+ * the maintained, well-known extension for this. sqlite3-ipaddr.c (sqlean's
+ * own thin wrapper, which also registers an unrelated sqlean_version()
+ * function) isn't vendored - ipaddr_init() is called directly instead.
  *
  * v-sekai/cockroach (checked separately) is a CI/build-only fork of upstream
  * CockroachDB with no behavioral changes, so there is no fork-specific type
@@ -26,6 +34,7 @@ SQLITE_EXTENSION_INIT1
 int sqlite3_uuid_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi);
 int sqlite3_decimal_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi);
 int sqlite3_series_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi);
+int ipaddr_init(sqlite3 *db);
 
 #ifdef _WIN32
 __declspec(dllexport)
@@ -47,5 +56,10 @@ int sqlite3_mvsqlitepgtypes_init(
         return rc;
     }
 
-    return sqlite3_series_init(db, pzErrMsg, pApi);
+    rc = sqlite3_series_init(db, pzErrMsg, pApi);
+    if (rc != SQLITE_OK) {
+        return rc;
+    }
+
+    return ipaddr_init(db);
 }

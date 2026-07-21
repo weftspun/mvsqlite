@@ -9,7 +9,7 @@ else
 	LDFLAGS += -shared -Wl,-z,noexecstack
 endif
 
-SRCS := pgtypes_ext.c uuid.c decimal.c series.c
+SRCS := pgtypes_ext.c uuid.c decimal.c series.c ipaddr/extension.c
 
 build: $(SRCS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o libmvsqlite_pgtypes.$(SOEXT) $(SRCS) -lm

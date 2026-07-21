@@ -215,6 +215,13 @@ jobs:
             echo "generate_series gave wrong result: $series"
             exit 1
           fi
+          contains_yes=$(sqlite3 :memory: -cmd ".load ./mvsqlite-pgtypes-ext/libmvsqlite_pgtypes" "SELECT ipcontains('10.0.0.0/8', '10.1.2.3');")
+          contains_no=$(sqlite3 :memory: -cmd ".load ./mvsqlite-pgtypes-ext/libmvsqlite_pgtypes" "SELECT ipcontains('10.0.0.0/8', '192.168.1.1');")
+          echo "ipcontains: yes=$contains_yes no=$contains_no"
+          if [ "$contains_yes" != "1" ] || [ "$contains_no" != "0" ]; then
+            echo "ipcontains gave wrong result"
+            exit 1
+          fi
   stress:
     name: mvstore stress test
     runs-on: ubuntu-22.04
