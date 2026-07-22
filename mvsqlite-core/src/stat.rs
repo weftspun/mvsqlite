@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::util::{decode_version, get_last_write_version};
-use crate::{server::Server, util::GoneError};
+use crate::{util::GoneError, Core};
 use anyhow::Result;
 use foundationdb::{
     options::{StreamingMode, TransactionOption},
@@ -24,7 +24,7 @@ pub struct StatResponse {
     pub interval: Option<Vec<u32>>,
 }
 
-impl Server {
+impl Core {
     pub async fn stat(
         &self,
         ns_id: [u8; 10],
@@ -42,10 +42,14 @@ impl Server {
         }
 
         let rv = txn.get_read_version().await?;
+        // ns_metadata_cache.get returns Arc<FdbError> on error, not FdbError -
+        // see the map_err comment further down in this file for why that
+        // matters for a bare `?`.
         let metadata = self
             .ns_metadata_cache
             .get(&txn, &self.key_codec, ns_id)
-            .await?;
+            .await
+            .map_err(|e| *e)?;
         let mut version: Option<[u8; 10]> = None;
 
         if let Some(lock) = &metadata.lock {
@@ -75,7 +79,17 @@ impl Server {
                     .try_get_with((rv, ns_id), async {
                         get_last_write_version(&txn, &self.key_codec, ns_id, true).await
                     })
-                    .await?
+                    .await
+                    // moka's try_get_with returns Arc<FdbError>, not FdbError -
+                    // `?` on that converts via std's blanket `impl<T: Error>
+                    // Error for Arc<T>`, wrapping the *Arc* as anyhow::Error's
+                    // top-level type. Since Arc<T>'s Debug/Display delegate
+                    // transparently, the result looks identical to a correctly
+                    // wrapped FdbError but silently fails
+                    // `downcast_ref::<FdbError>()` (different concrete type) -
+                    // exactly the bug this comment is here to stop someone
+                    // from reintroducing. Unwrap back to a plain FdbError first.
+                    .map_err(|e| *e)?
             }
         };
 

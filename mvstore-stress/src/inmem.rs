@@ -52,6 +52,13 @@ impl Inmem {
         }
 
         let mut this = self.inflight.remove(&id).expect("inflight not found");
+        tracing::debug!(
+            id,
+            version,
+            from_version,
+            write_set = ?this.write_set,
+            "commit_transaction"
+        );
         let prev_versions = self
             .versions
             .range(format!("{}\0", from_version)..version.to_string());
@@ -121,10 +128,22 @@ impl Inmem {
             let computed_hash = blake3::hash(data);
             let stored_hash = match txn_info.snapshot.get(&index) {
                 Some(x) => *x,
-                None => panic!("page not found: {} ({})", index, desc),
+                None => panic!(
+                    "page not found: {} ({}), id={}, got_hash={}",
+                    index,
+                    desc,
+                    id,
+                    hex::encode(computed_hash.as_bytes())
+                ),
             };
             if stored_hash != *computed_hash.as_bytes() {
-                panic!("hash mismatch at index {}", index);
+                panic!(
+                    "hash mismatch at index {}, id={}, expected={}, got={}",
+                    index,
+                    id,
+                    hex::encode(stored_hash),
+                    hex::encode(computed_hash.as_bytes())
+                );
             }
         }
 

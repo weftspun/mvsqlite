@@ -14,17 +14,107 @@ use futures::TryStreamExt;
 use crate::{
     fixed::FixedKeyVec,
     lock::DistributedLock,
-    server::Server,
     util::{
         add_single_key_read_conflict_range, decode_version, extract_10_byte_suffix,
         get_txn_read_version_as_versionstamp, truncate_10_byte_suffix, ContentIndex,
     },
+    Core,
 };
 
 pub static GC_SCAN_BATCH_SIZE: AtomicUsize = AtomicUsize::new(5000);
 pub static GC_FRESH_PAGE_TTL_SECS: AtomicU64 = AtomicU64::new(3600);
+/// How long a commit's idempotency record (see
+/// `KeyCodec::construct_idempotency_record_key`) survives before
+/// `sweep_idempotency_records` may delete it. Default 24 hours, matching
+/// industry practice for this exact pattern (e.g. Stripe prunes idempotency
+/// keys after 24h) - deliberately a long horizon, not a short TTL tied to
+/// how long a client might plausibly still be retrying: the record is tiny,
+/// the sweep is async and off the hot path, and a long horizon costs
+/// nothing but a little storage in exchange for never being the thing that
+/// silently reopens the phantom-commit hole because a slow client's retry
+/// arrived just after cleanup.
+pub static IDEMPOTENCY_RECORD_TTL_SECS: AtomicU64 = AtomicU64::new(86400);
 
-impl Server {
+impl Core {
+    /// Deletes idempotency records (see
+    /// `KeyCodec::construct_idempotency_record_key`) older than
+    /// `IDEMPOTENCY_RECORD_TTL_SECS`. Unlike `delete_unreferenced_content`,
+    /// this needs no cross-referencing pass - each record's own embedded
+    /// timestamp (via `ContentIndex`, the same encoding used for content
+    /// freshness tracking) is independently sufficient to decide
+    /// eligibility, so this is a single scan-and-delete sweep.
+    pub async fn sweep_idempotency_records(
+        self: Arc<Self>,
+        dry_run: bool,
+        ns_id: [u8; 10],
+        now: Duration,
+        mut progress_callback: impl FnMut(Option<u64>),
+    ) -> Result<()> {
+        let ttl = Duration::from_secs(IDEMPOTENCY_RECORD_TTL_SECS.load(Ordering::Relaxed));
+        let scan_start = self
+            .key_codec
+            .construct_idempotency_record_key(ns_id, [0u8; 16]);
+        let scan_end = self
+            .key_codec
+            .construct_idempotency_record_key(ns_id, [0xffu8; 16]);
+
+        let mut lock = DistributedLock::new(
+            self.key_codec
+                .construct_nstask_key(ns_id, "sweep_idempotency_records"),
+            "sweep_idempotency_records".into(),
+        );
+        let me = self.clone();
+        let locked = lock
+            .lock(
+                move || {
+                    me.db
+                        .create_trx()
+                        .with_context(|| "transaction creation failed")
+                },
+                Duration::from_secs(5),
+            )
+            .await?;
+        if !locked {
+            anyhow::bail!("failed to acquire lock");
+        }
+
+        let mut deletion_set: Vec<Vec<u8>> = vec![];
+        self.scan_range_simple(&lock, scan_start, scan_end, |kv| {
+            if let Ok(entry) = ContentIndex::decode(kv.value()) {
+                if now.saturating_sub(entry.time) >= ttl {
+                    deletion_set.push(kv.key().to_vec());
+                }
+            }
+        })
+        .await?;
+
+        if !deletion_set.is_empty() && !dry_run {
+            for chunk in deletion_set.chunks(GC_SCAN_BATCH_SIZE.load(Ordering::Relaxed)) {
+                loop {
+                    let txn = lock.create_txn_and_check_sync(&self.db).await?;
+                    for item in chunk {
+                        txn.clear(item);
+                    }
+                    match txn.commit().await {
+                        Ok(_) => break,
+                        Err(e) => {
+                            e.on_error().await?;
+                        }
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            ns = hex::encode(&ns_id),
+            count = deletion_set.len(),
+            dry = dry_run,
+            "swept idempotency records"
+        );
+        progress_callback(Some(deletion_set.len() as u64));
+        progress_callback(None);
+        Ok(())
+    }
     pub async fn truncate_versions(
         self: Arc<Self>,
         dry_run: bool,
@@ -44,7 +134,8 @@ impl Server {
             let metadata = self
                 .ns_metadata_cache
                 .get(&txn, &self.key_codec, ns_id)
-                .await?;
+                .await
+                .map_err(|e| *e)?;
             if let Some(lock) = &metadata.lock {
                 before_version = before_version.min(decode_version(&lock.snapshot_version)?);
             }

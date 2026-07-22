@@ -17,7 +17,10 @@ use crate::{
     keys::KeyCodec,
     page::{Page, MAX_PAGE_SIZE},
     util::ContentIndex,
+    Core,
 };
+use anyhow::{Context, Result as AnyResult};
+use foundationdb::{options::TransactionOption, FdbError};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -74,16 +77,14 @@ impl<'a> WriteApplier<'a> {
     pub async fn apply_write<'b>(
         &mut self,
         write_reqs: &[WriteRequest<'b>],
-    ) -> Option<Vec<WriteResponse>> {
+    ) -> anyhow::Result<Vec<WriteResponse>> {
         for req in write_reqs {
             if req.data.len() > MAX_PAGE_SIZE {
-                tracing::warn!(
-                    ns = hex::encode(&self.ns_id),
-                    len = req.data.len(),
-                    limit = MAX_PAGE_SIZE,
-                    "page is too large"
+                anyhow::bail!(
+                    "page is too large: {} bytes (limit {})",
+                    req.data.len(),
+                    MAX_PAGE_SIZE
                 );
-                return None;
             }
         }
 
@@ -132,15 +133,13 @@ impl<'a> WriteApplier<'a> {
                         }
                         Err(e) => {
                             tracing::warn!(ns = hex::encode(&self.ns_id), error = %e, "error getting content");
-                            Err(())
+                            Err(anyhow::Error::from(e))
                         }
                     }
                 });
             }
             while let Some(res) = fut.next().await {
-                if res.is_err() {
-                    return None;
-                }
+                res?;
             }
         }
 
@@ -190,7 +189,7 @@ impl<'a> WriteApplier<'a> {
                                     error = %e,
                                     "delta encoding failed"
                                 );
-                                Err(())
+                                Err(e)
                             }
                         }
                     } else {
@@ -202,10 +201,7 @@ impl<'a> WriteApplier<'a> {
             let mut delta_base_hashes: Vec<Hash> = Vec::new();
 
             while let Some(delta_base_hash) = fut.next().await {
-                let delta_base_hash = match delta_base_hash {
-                    Ok(x) => x,
-                    Err(()) => return None,
-                };
+                let delta_base_hash = delta_base_hash?;
                 if let Some(delta_base_hash) = delta_base_hash {
                     delta_base_hashes.push(delta_base_hash.into());
                 }
@@ -231,6 +227,43 @@ impl<'a> WriteApplier<'a> {
             self.seen_hashes.insert(req.hash);
         }
 
-        Some(pregenerated_res)
+        Ok(pregenerated_res)
+    }
+}
+
+impl Core {
+    /// Applies a batch of page writes to `ns_id` in a single FDB transaction
+    /// and commits it. Mirrors mvstore's old `/batch/write` handler
+    /// (`batch_write`), minus the streaming request/response framing - takes
+    /// and returns plain in-memory `Vec`s since there's no wire in Direct
+    /// mode.
+    pub async fn write_pages(
+        &self,
+        ns_id: [u8; 10],
+        now: Duration,
+        write_reqs: &[WriteRequest<'_>],
+    ) -> AnyResult<Vec<WriteResponse>> {
+        let txn = self.db.create_trx()?;
+        // It's safe to set CRR for the write path. Seeing stale data doesn't affect correctness.
+        txn.set_option(TransactionOption::CausalReadRisky).unwrap();
+
+        let mut applier = WriteApplier::new(WriteApplierContext {
+            txn: &txn,
+            ns_id,
+            key_codec: &self.key_codec,
+            now,
+            content_cache: self.content_cache.as_ref(),
+        });
+        let res = applier
+            .apply_write(write_reqs)
+            .await
+            .with_context(|| "cannot apply write")?;
+
+        txn.commit()
+            .await
+            .map_err(FdbError::from)
+            .with_context(|| "error committing transaction")?;
+
+        Ok(res)
     }
 }

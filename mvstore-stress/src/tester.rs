@@ -1,12 +1,13 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::sync::RwLock;
 
 use anyhow::Result;
 use mvclient::{CommitError, CommitOutput, MultiVersionClient, Transaction};
+use mvsqlite_core::Core;
 use rand::{thread_rng, Rng, RngCore};
 
 use crate::inmem::Inmem;
@@ -14,23 +15,24 @@ use crate::inmem::Inmem;
 pub struct Tester {
     mem: RwLock<Inmem>,
     client: Arc<MultiVersionClient>,
+    core: Arc<Core>,
     busy_versions: Mutex<BTreeMap<String, u64>>,
     config: TesterConfig,
 }
 
 pub struct TesterConfig {
     pub disable_ryw: bool,
-    pub admin_api: String,
     pub num_pages: u32,
-    pub permit_410: bool,
     pub disable_read_set: bool,
+    pub permit_bad_page_reference: bool,
 }
 
 impl Tester {
-    pub fn new(client: Arc<MultiVersionClient>, config: TesterConfig) -> Arc<Self> {
+    pub fn new(client: Arc<MultiVersionClient>, core: Arc<Core>, config: TesterConfig) -> Arc<Self> {
         Arc::new(Self {
             mem: RwLock::new(Inmem::new()),
             client,
+            core,
             busy_versions: Mutex::new(BTreeMap::new()),
             config,
         })
@@ -40,6 +42,8 @@ impl Tester {
         let truncate_worker = tokio::spawn(self.clone().truncate_worker());
         let delete_unreferenced_content_worker =
             tokio::spawn(self.clone().delete_unreferenced_content_worker());
+        let sweep_idempotency_records_worker =
+            tokio::spawn(self.clone().sweep_idempotency_records_worker());
         let handles = (0..concurrency)
             .map(|i| {
                 let me = self.clone();
@@ -51,10 +55,17 @@ impl Tester {
         }
         truncate_worker.abort();
         delete_unreferenced_content_worker.abort();
+        sweep_idempotency_records_worker.abort();
+    }
+
+    async fn resolve_ns_id(&self) -> Result<[u8; 10]> {
+        self.core
+            .lookup_nskey(&self.client.config().ns_key, None)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("namespace not found"))
     }
 
     async fn truncate_worker(self: Arc<Self>) {
-        let rc = reqwest::Client::new();
         loop {
             let sleep_dur_ms = rand::thread_rng().gen_range(1..1000);
             let sleep_dur = Duration::from_millis(sleep_dur_ms);
@@ -91,26 +102,31 @@ impl Tester {
                     .cloned()
                     .collect::<Vec<_>>();
             }
-            let payload = serde_json::json!({
-                "key": &self.client.config().ns_key,
-                "before_version": &remove_point,
-                "apply": true,
-            });
+
+            let ns_id = match self.resolve_ns_id().await {
+                Ok(x) => x,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to resolve namespace for truncation");
+                    continue;
+                }
+            };
+            let before_version = match mvsqlite_core::util::decode_version(&remove_point) {
+                Ok(x) => x,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to decode truncation version");
+                    continue;
+                }
+            };
             tracing::info!(remove_point = remove_point, "triggering truncation");
-            match rc
-                .post(format!("{}/api/truncate_namespace", self.config.admin_api,))
-                .json(&payload)
-                .send()
+            match self
+                .core
+                .clone()
+                .truncate_versions(false, ns_id, before_version, |_| {})
                 .await
             {
-                Ok(res) => match res.bytes().await {
-                    Ok(_) => {
-                        tracing::info!("truncated namespace");
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "failed to read response for truncate namespace");
-                    }
-                },
+                Ok(()) => {
+                    tracing::info!("truncated namespace");
+                }
                 Err(e) => {
                     tracing::error!(error = %e, "failed to truncate namespace");
                 }
@@ -119,35 +135,63 @@ impl Tester {
     }
 
     async fn delete_unreferenced_content_worker(self: Arc<Self>) {
-        let rc = reqwest::Client::new();
         loop {
             let sleep_dur_ms = rand::thread_rng().gen_range(1..5000);
             let sleep_dur = Duration::from_millis(sleep_dur_ms);
             tokio::time::sleep(sleep_dur).await;
-            let payload = serde_json::json!({
-                "key": &self.client.config().ns_key,
-                "apply": true,
-            });
+
+            let ns_id = match self.resolve_ns_id().await {
+                Ok(x) => x,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to resolve namespace for duc");
+                    continue;
+                }
+            };
             tracing::info!("triggering duc");
-            match rc
-                .post(format!(
-                    "{}/api/delete_unreferenced_content",
-                    self.config.admin_api,
-                ))
-                .json(&payload)
-                .send()
+            match self
+                .core
+                .clone()
+                .delete_unreferenced_content(false, ns_id, |_| {})
                 .await
             {
-                Ok(res) => match res.bytes().await {
-                    Ok(_) => {
-                        tracing::info!("deleted unreferenced content");
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "failed to read response for duc");
-                    }
-                },
+                Ok(()) => {
+                    tracing::info!("deleted unreferenced content");
+                }
                 Err(e) => {
                     tracing::error!(error = %e, "failed to delete unreferenced content");
+                }
+            }
+        }
+    }
+
+    async fn sweep_idempotency_records_worker(self: Arc<Self>) {
+        loop {
+            let sleep_dur_ms = rand::thread_rng().gen_range(1..5000);
+            let sleep_dur = Duration::from_millis(sleep_dur_ms);
+            tokio::time::sleep(sleep_dur).await;
+
+            let ns_id = match self.resolve_ns_id().await {
+                Ok(x) => x,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to resolve namespace for idempotency sweep");
+                    continue;
+                }
+            };
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap();
+            tracing::info!("triggering idempotency record sweep");
+            match self
+                .core
+                .clone()
+                .sweep_idempotency_records(false, ns_id, now, |_| {})
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!("swept idempotency records");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to sweep idempotency records");
                 }
             }
         }
@@ -174,7 +218,7 @@ impl Tester {
 
     async fn task(self: Arc<Self>, task_id: usize, iterations: usize) -> Result<()> {
         let mut mem = self.mem.write().await;
-        let mut txn = self.client.create_transaction(None).await?;
+        let mut txn = self.client.create_transaction()?;
         let mut txn_id = mem.start_transaction(txn.version());
         self.acquire_version(txn.version());
         drop(mem);
@@ -196,7 +240,19 @@ impl Tester {
                     for &id in &reads {
                         txn.mark_read(id);
                     }
-                    let pages = txn.read_many_nomark(&reads).await?;
+                    let pages = match txn.read_many_nomark(&reads) {
+                        Ok(x) => x,
+                        Err(e) if mvclient::is_retryable(&e) => {
+                            tracing::debug!(error = %e, "retryable read error, restarting transaction");
+                            let mut mem = self.mem.write().await;
+                            mem.drop_transaction(txn_id);
+                            self.release_version(txn.version());
+                            drop(mem);
+                            (txn, txn_id) = self.create_transaction_random_base().await?;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
                     let mut mem = self.mem.write().await;
                     for (&index, page) in reads.iter().zip(pages.iter()) {
                         tracing::debug!(
@@ -252,7 +308,7 @@ impl Tester {
                         .iter()
                         .map(|(index, data)| (*index, data.as_slice()))
                         .collect::<Vec<_>>();
-                    txn.write_many(&writes).await?;
+                    txn.write_many(&writes)?;
                     let mut mem = self.mem.write().await;
                     for &(index, data) in &writes {
                         mem.write_page(txn_id, index, data);
@@ -262,26 +318,20 @@ impl Tester {
                     let mut mem = self.mem.write().await;
                     let version = txn.version().to_string();
                     let txn_version = txn.version().to_string();
-                    match txn.commit(None, &HashMap::new()).await {
+                    match txn.commit(None, &HashMap::new()) {
                         Ok(CommitOutput::Committed(info)) => {
                             mem.commit_transaction(txn_id, &info.version, txn_version.as_str());
                         }
                         Ok(CommitOutput::Conflict) => mem.drop_transaction(txn_id),
                         Ok(CommitOutput::Empty) => mem.drop_transaction(txn_id),
                         Err(e) => {
-                            let mut ignore = false;
-                            if let Some(x) = e.downcast_ref::<CommitError>() {
-                                match x {
-                                    CommitError::Status(code)
-                                        if code.as_u16() == 410 && self.config.permit_410 =>
-                                    {
-                                        tracing::warn!("ignored http 410 as requested");
-                                        ignore = true;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            if ignore {
+                            let permitted = self.config.permit_bad_page_reference
+                                && matches!(
+                                    e.downcast_ref::<CommitError>(),
+                                    Some(CommitError::BadPageReference)
+                                );
+                            if permitted {
+                                tracing::warn!("ignored bad page reference as requested");
                                 mem.drop_transaction(txn_id);
                             } else {
                                 return Err(e);
@@ -321,7 +371,7 @@ impl Tester {
             if let Some(version) = mem.pick_random_version() {
                 let mut txn = self
                     .client
-                    .create_transaction_at_version(None, version, false);
+                    .create_transaction_at_version(version, false)?;
                 let txn_id = mem.start_transaction(txn.version());
                 self.acquire_version(txn.version());
                 if !self.config.disable_read_set && thread_rng().gen_bool(0.5) {
@@ -331,7 +381,7 @@ impl Tester {
             }
         }
 
-        let mut txn = self.client.create_transaction(None).await?;
+        let mut txn = self.client.create_transaction()?;
         let txn_id = mem.start_transaction(txn.version());
         self.acquire_version(txn.version());
         if !self.config.disable_read_set && thread_rng().gen_bool(0.5) {

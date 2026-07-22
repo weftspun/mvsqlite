@@ -11,14 +11,13 @@ use foundationdb::{
 use futures::TryStreamExt;
 use moka::future::Cache;
 use thiserror::Error;
-use tokio::task::block_in_place;
 
 use crate::{
     fixed::FixedString,
     keys::KeyCodec,
     page::{MAX_PAGE_SIZE, PAGE_ENCODING_DELTA, PAGE_ENCODING_NONE, PAGE_ENCODING_ZSTD},
     replica::ReplicaManager,
-    util::decode_version,
+    util::{decode_version, CacheError},
 };
 use anyhow::{Context, Result};
 
@@ -146,10 +145,7 @@ impl<'a> DeltaReader<'a> {
                         {
                             None
                         } else {
-                            return Err(anyhow::anyhow!(
-                                "failed to load decoded page content into cache: {}",
-                                e
-                            ));
+                            return Err(CacheError(e).into());
                         }
                     }
                 }
@@ -191,10 +187,12 @@ impl<'a> DeltaReader<'a> {
             }
             PAGE_ENCODING_ZSTD => {
                 // zstd
-                let data = block_in_place(|| {
-                    zstd::bulk::decompress(&data_container.as_ref()[1..], MAX_PAGE_SIZE)
-                })
-                .with_context(|| "zstd decompress failed")?;
+                // Pages are capped at MAX_PAGE_SIZE (32KiB), so this decompression is
+                // fast enough to run inline - block_in_place would panic here on a
+                // current-thread Tokio runtime (e.g. a Direct-mode client with a
+                // single-threaded IoEngine), and isn't needed for data this small.
+                let data = zstd::bulk::decompress(&data_container.as_ref()[1..], MAX_PAGE_SIZE)
+                    .with_context(|| "zstd decompress failed")?;
                 Ok(Bytes::from(data))
             }
             _ => Err(anyhow::anyhow!(
@@ -227,9 +225,8 @@ impl<'a> DeltaReader<'a> {
                     Some(x) => self.decode_page_no_delta(x).await?,
                     None => anyhow::bail!("base page not found"),
                 };
-                let mut delta_data = block_in_place(|| {
-                    zstd::bulk::decompress(&data_container.as_ref()[33..], MAX_PAGE_SIZE)
-                })?;
+                let mut delta_data =
+                    zstd::bulk::decompress(&data_container.as_ref()[33..], MAX_PAGE_SIZE)?;
                 if delta_data.len() != base_page.len() {
                     anyhow::bail!("delta and base have different sizes");
                 }

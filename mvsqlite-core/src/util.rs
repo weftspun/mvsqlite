@@ -57,6 +57,28 @@ impl ContentIndex {
 #[error("gone: {0}")]
 pub struct GoneError(pub &'static str);
 
+/// Wraps the `Arc<anyhow::Error>` that `moka`'s `try_get_with` returns on
+/// error, preserving it as a proper `source()` instead of losing its type
+/// via string interpolation (`anyhow!("...: {}", e)`). That distinction
+/// matters: something further up the call chain - notably
+/// `mvclient::is_retryable`'s search for a `FdbError` anywhere in the
+/// chain - needs the original error type to still be reachable, not just
+/// its formatted message.
+#[derive(Debug)]
+pub struct CacheError(pub std::sync::Arc<anyhow::Error>);
+
+impl std::fmt::Display for CacheError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for CacheError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&**self.0)
+    }
+}
+
 pub fn add_single_key_read_conflict_range(txn: &Transaction, key: &[u8]) -> Result<(), FdbError> {
     txn.add_conflict_range(
         key,
@@ -99,4 +121,13 @@ pub fn extract_10_byte_suffix(data: &[u8]) -> [u8; 10] {
 pub fn extract_beu32_suffix(data: &[u8]) -> u32 {
     assert!(data.len() >= 4);
     u32::from_be_bytes(<[u8; 4]>::try_from(&data[data.len() - 4..]).unwrap())
+}
+
+/// The PLCC/LWV conflict-detection rule, shared by every conflict check in
+/// `commit.rs`: a version observed by a transaction conflicts with the
+/// current version of the same resource iff the current version is strictly
+/// newer. Versions are 10-byte big-endian (8-byte FDB commit version + 2-byte
+/// in-batch order), so byte-lexicographic comparison is numeric comparison.
+pub fn version_conflicts(current_version: [u8; 10], observed_version: [u8; 10]) -> bool {
+    current_version > observed_version
 }

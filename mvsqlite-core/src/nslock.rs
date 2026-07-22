@@ -18,7 +18,6 @@ use foundationdb::{
     Database, RangeOption, Transaction,
 };
 use futures::TryStreamExt;
-use hyper::{Body, Response};
 use rand::Rng;
 use serde::Deserialize;
 
@@ -32,6 +31,24 @@ pub enum NslockReleaseMode {
     #[serde(rename = "rollback")]
     Rollback,
 }
+
+/// Transport-agnostic outcome of an nslock operation. Callers (mvstore's HTTP
+/// layer, or a direct-FDB client) translate this into their own wire format.
+pub enum NslockOutcome {
+    /// Lock acquired, or release/rollback completed.
+    Ok,
+    /// Acquire: already held by the same owner (idempotent no-op).
+    AlreadyHeldBySelf,
+    /// Owner string was empty or too long.
+    InvalidOwner,
+    /// Locked/owned by a different owner than the caller.
+    OwnedByOther(String),
+    /// Release: namespace was not locked at all.
+    NotLocked,
+    /// The lock nonce this caller was tracking is gone (raced with another release).
+    Gone,
+}
+
 pub async fn acquire_nslock(
     db: &Database,
     key_codec: &KeyCodec,
@@ -39,27 +56,22 @@ pub async fn acquire_nslock(
     ns_id: [u8; 10],
     owner: &str,
     version: Option<&str>,
-) -> Result<Response<Body>> {
+) -> Result<NslockOutcome> {
     if owner.is_empty() || owner.as_bytes().len() > MAX_OWNER_STR_BYTE_SIZE {
-        return Ok(Response::builder()
-            .status(400)
-            .body(Body::from("invalid owner\n"))?);
+        return Ok(NslockOutcome::InvalidOwner);
     }
 
     let mut txn = db.create_trx()?;
     loop {
-        let metadata = ns_metadata_cache.get(&txn, key_codec, ns_id).await?;
+        let metadata = ns_metadata_cache.get(&txn, key_codec, ns_id).await.map_err(|e| *e)?;
         let mut metadata = (*metadata).clone();
 
         // Is this lock already held?
         if let Some(lock) = &metadata.lock {
             if lock.owner == owner {
-                return Ok(Response::builder().status(201).body(Body::empty())?);
+                return Ok(NslockOutcome::AlreadyHeldBySelf);
             } else {
-                return Ok(Response::builder()
-                    .status(409)
-                    .header("x-lock-owner", &lock.owner)
-                    .body(Body::from("namespace is locked by another owner\n"))?);
+                return Ok(NslockOutcome::OwnedByOther(lock.owner.clone()));
             }
         }
 
@@ -81,7 +93,7 @@ pub async fn acquire_nslock(
         ns_metadata_cache.set(&txn, key_codec, ns_id, Arc::new(metadata))?;
         match txn.commit().await {
             Ok(_) => {
-                return Ok(Response::builder().status(201).body(Body::empty())?);
+                return Ok(NslockOutcome::Ok);
             }
             Err(e) => {
                 txn = e.on_error().await?;
@@ -97,11 +109,9 @@ pub async fn release_nslock(
     ns_id: [u8; 10],
     owner: &str,
     mode: NslockReleaseMode,
-) -> Result<Response<Body>> {
+) -> Result<NslockOutcome> {
     if owner.is_empty() {
-        return Ok(Response::builder()
-            .status(400)
-            .body(Body::from("invalid owner\n"))?);
+        return Ok(NslockOutcome::InvalidOwner);
     }
 
     let rollback_cursor_key = key_codec.construct_nsrollbackcursor_key(ns_id);
@@ -111,22 +121,17 @@ pub async fn release_nslock(
     let snapshot_version: [u8; 10];
 
     loop {
-        let metadata = ns_metadata_cache.get(&txn, key_codec, ns_id).await?;
+        let metadata = ns_metadata_cache.get(&txn, key_codec, ns_id).await.map_err(|e| *e)?;
         let mut metadata = (*metadata).clone();
 
         if metadata.lock.is_none() {
-            return Ok(Response::builder()
-                .status(422)
-                .body(Body::from("namespace is not locked"))?);
+            return Ok(NslockOutcome::NotLocked);
         }
 
         // Can we unlock?
         let lock = metadata.lock.as_mut().unwrap();
         if lock.owner != owner {
-            return Ok(Response::builder()
-                .status(422)
-                .header("x-lock-owner", &lock.owner)
-                .body(Body::from("namespace is locked by another owner"))?);
+            return Ok(NslockOutcome::OwnedByOther(lock.owner.clone()));
         }
 
         match mode {
@@ -137,7 +142,7 @@ pub async fn release_nslock(
 
                 match txn.commit().await {
                     Ok(_) => {
-                        return Ok(Response::builder().status(201).body(Body::empty())?);
+                        return Ok(NslockOutcome::Ok);
                     }
                     Err(e) => {
                         txn = e.on_error().await?;
@@ -189,9 +194,7 @@ pub async fn release_nslock(
     loop {
         let valid = lock_is_still_valid(&txn, key_codec, ns_metadata_cache, ns_id, &nonce).await?;
         if !valid {
-            return Ok(Response::builder()
-                .status(410)
-                .body(Body::from("lock is gone"))?);
+            return Ok(NslockOutcome::Gone);
         }
 
         // Snapshot read is correct here because conflict range added by lock_is_still_valid is enough
@@ -247,9 +250,7 @@ pub async fn release_nslock(
     loop {
         let valid = lock_is_still_valid(&txn, key_codec, ns_metadata_cache, ns_id, &nonce).await?;
         if !valid {
-            return Ok(Response::builder()
-                .status(410)
-                .body(Body::from("lock is gone"))?);
+            return Ok(NslockOutcome::Gone);
         }
 
         // Patch LWV
@@ -270,7 +271,7 @@ pub async fn release_nslock(
         }
 
         // Unlock
-        let metadata = ns_metadata_cache.get(&txn, key_codec, ns_id).await?;
+        let metadata = ns_metadata_cache.get(&txn, key_codec, ns_id).await.map_err(|e| *e)?;
         let mut metadata = (*metadata).clone();
         metadata.lock = None;
         ns_metadata_cache.set(&txn, key_codec, ns_id, Arc::new(metadata))?;
@@ -283,7 +284,7 @@ pub async fn release_nslock(
         }
     }
 
-    Ok(Response::builder().status(200).body(Body::empty())?)
+    Ok(NslockOutcome::Ok)
 }
 
 async fn lock_is_still_valid(
@@ -293,7 +294,7 @@ async fn lock_is_still_valid(
     ns_id: [u8; 10],
     nonce: &str,
 ) -> Result<bool> {
-    let metadata = ns_metadata_cache.get(&txn, key_codec, ns_id).await?;
+    let metadata = ns_metadata_cache.get(&txn, key_codec, ns_id).await.map_err(|e| *e)?;
     if let Some(lock) = &metadata.lock {
         if lock.nonce == nonce {
             return Ok(true);

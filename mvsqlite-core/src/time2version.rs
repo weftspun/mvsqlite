@@ -1,10 +1,10 @@
 use std::time::SystemTime;
 
-use crate::{keys::KeyCodec, replica::ReplicaManager};
+use crate::{keys::KeyCodec, replica::ReplicaManager, Core};
 use anyhow::Result;
 use foundationdb::{
     future::{FdbValue},
-    options::StreamingMode,
+    options::{StreamingMode, TransactionOption},
     tuple::unpack,
     RangeOption, Transaction,
 };
@@ -105,4 +105,20 @@ pub async fn time2version(
     let not_after = map_it(not_after);
 
     Ok(TimeToVersionResponse { after, not_after })
+}
+
+impl Core {
+    /// Convenience wrapper around the free `time2version()` function that
+    /// also sets the transaction options the old `/time2version` HTTP
+    /// handler set (`ReadLockAware` if read-only, `CausalReadRisky` always -
+    /// it's safe here because a stale read of the timekeeper's writes just
+    /// means a slightly conservative time-to-version mapping).
+    pub async fn time2version(&self, timestamp_secs: u64) -> Result<TimeToVersionResponse> {
+        let txn = self.db.create_trx()?;
+        if self.is_read_only() {
+            txn.set_option(TransactionOption::ReadLockAware).unwrap();
+        }
+        txn.set_option(TransactionOption::CausalReadRisky).unwrap();
+        time2version(&txn, &self.key_codec, timestamp_secs, self.replica_manager.as_ref()).await
+    }
 }
