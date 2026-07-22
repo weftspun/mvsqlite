@@ -2,41 +2,46 @@ mod backoff;
 
 use anyhow::{Context, Result};
 use backoff::RandomizedExponentialBackoff;
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use bytes::Bytes;
-use rand::{Rng, RngCore};
-use reqwest::{
-    header::{HeaderMap, HeaderValue},
-    RequestBuilder, StatusCode, Url,
+use foundationdb::FdbError;
+use mvsqlite_core::{
+    commit::{CommitContext, CommitNamespaceContext, CommitResult as CoreCommitResult},
+    namespace::NamespaceLookup,
+    read::ReadPageRequest,
+    util::decode_version,
+    write::WriteRequest as CoreWriteRequest,
+    Core,
 };
-use serde::{Deserialize, Serialize};
+use rand::RngCore;
 use std::{
     collections::{HashMap, HashSet},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
-    time::{Duration, Instant},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime},
 };
 use thiserror::Error;
-use tokio::sync::{OwnedRwLockReadGuard, OwnedSemaphorePermit, Semaphore};
 
 #[derive(Debug, Error)]
 pub enum CommitError {
-    #[error("commit error: {0:?}")]
-    Status(StatusCode),
+    #[error("commit error: {0}")]
+    Failed(String),
+
+    /// A page in the read set (or a delta chain) was pruned by GC before
+    /// this commit could validate against it. Corresponds to the old HTTP
+    /// transport's 410 Gone response.
+    #[error("bad page reference")]
+    BadPageReference,
+
+    #[error("namespace not distinct")]
+    NamespaceNotDistinct,
 }
 
 pub struct MultiVersionClient {
-    client: reqwest::Client,
+    core: Arc<Core>,
     config: MultiVersionClientConfig,
 }
 
 #[derive(Clone, Debug)]
 pub struct MultiVersionClientConfig {
-    /// Data plane URL.
-    pub data_plane: Vec<Url>,
-
     /// Namespace key.
     pub ns_key: String,
 
@@ -45,14 +50,6 @@ pub struct MultiVersionClientConfig {
     pub lock_owner: Option<String>,
 }
 
-impl MultiVersionClientConfig {
-    fn random_data_plane(&self) -> &Url {
-        let index = rand::thread_rng().gen_range(0..self.data_plane.len());
-        &self.data_plane[index]
-    }
-}
-
-#[derive(Deserialize)]
 pub struct StatResponse {
     pub version: String,
     pub metadata: String,
@@ -60,55 +57,15 @@ pub struct StatResponse {
     pub interval: Option<Vec<u32>>,
 }
 
-#[derive(Serialize)]
-pub struct ReadRequest<'a> {
-    pub page_index: u32,
-    pub version: &'a str,
-
-    #[serde(default)]
-    #[serde(with = "serde_bytes")]
-    pub hash: Option<&'a [u8]>,
-
-    #[serde(default)]
-    pub accept_zstd: bool,
-}
-
-#[derive(Deserialize)]
-pub struct ReadResponse<'a> {
-    pub version: &'a str,
-    #[serde(with = "serde_bytes")]
-    pub data: &'a [u8],
-    #[serde(default)]
-    pub zstd: bool,
-}
-
-#[derive(Serialize)]
 pub struct WriteRequest<'a> {
-    #[serde(with = "serde_bytes")]
     pub data: &'a [u8],
-
     pub delta_base: Option<u32>,
 }
 
-#[derive(Deserialize)]
-pub struct WriteResponse<'a> {
-    #[serde(with = "serde_bytes")]
-    pub hash: &'a [u8],
+pub struct WriteResponse {
+    pub hash: Vec<u8>,
 }
 
-#[derive(Serialize)]
-pub struct CommitGlobalInit<'a> {
-    #[serde(with = "serde_bytes")]
-    pub idempotency_key: &'a [u8],
-
-    pub allow_skip_idempotency_check: bool,
-
-    pub num_namespaces: usize,
-
-    pub lock_owner: Option<&'a str>,
-}
-
-#[derive(Serialize)]
 pub struct CommitNamespaceInit {
     pub ns_key: String,
     pub ns_key_hashproof: Option<String>,
@@ -118,18 +75,10 @@ pub struct CommitNamespaceInit {
     pub read_set: Option<HashSet<u32>>,
 }
 
-#[derive(Serialize)]
 pub struct CommitRequest {
     pub page_index: u32,
-    #[serde(with = "serde_bytes")]
     pub hash: Vec<u8>,
-    #[serde(default)]
     pub data: Option<Bytes>,
-}
-
-#[derive(Deserialize)]
-pub struct CommitResponse {
-    pub changelog: HashMap<String, Vec<u32>>,
 }
 
 pub struct CommitResult {
@@ -145,110 +94,166 @@ pub enum CommitOutput {
     Empty,
 }
 
+/// A commit intent for one namespace, ready to be applied by
+/// `MultiVersionClient::apply_commit_intents`. `ns_id` is resolved once (at
+/// `create_transaction_with_info` time, cached by `Core::lookup_nskey`) and
+/// carried alongside `init` so `apply_commit_intents` doesn't need to
+/// re-resolve `ns_key` -> `ns_id` on every commit.
 pub struct NamespaceCommitIntent {
+    pub ns_id: [u8; 10],
     pub init: CommitNamespaceInit,
     pub requests: Vec<CommitRequest>,
 }
 
-#[derive(Deserialize)]
 pub struct TimeToVersionResponse {
     pub after: Option<TimeToVersionPoint>,
     pub not_after: Option<TimeToVersionPoint>,
 }
 
-#[derive(Deserialize)]
 pub struct TimeToVersionPoint {
     pub version: String,
     pub time: u64,
 }
 
+/// True if retrying the FDB operation that produced this error might
+/// succeed - i.e. it's a transient/conflict error, not a logic error.
+pub fn is_retryable(e: &anyhow::Error) -> bool {
+    // `.with_context(...)` (used throughout mvsqlite-core's read/commit
+    // paths) wraps the real error, changing the top-level type - a plain
+    // `e.downcast_ref::<FdbError>()` only checks that top-level type and
+    // misses a retryable FdbError that's still present as the source
+    // further down the chain. Search the whole chain instead.
+    e.chain()
+        .find_map(|cause| cause.downcast_ref::<FdbError>())
+        .map(|x| x.is_retryable())
+        .unwrap_or(false)
+}
+
+/// The single place every FDB operation in this crate retries through.
+/// Calls `op` until it returns `Ok`, a non-retryable `Err`, or the outer
+/// retry loop otherwise decides to give up (currently: never - `op` is
+/// expected to be a single FDB attempt, and giving up is `op`'s decision to
+/// make by returning a non-retryable error, e.g. a real conflict).
+///
+/// This exists so every FDB-calling method shares one retry policy instead
+/// of each hand-rolling its own copy of the same loop - a duplicated loop
+/// is a duplicated place to forget the retry entirely, which is exactly how
+/// three of this crate's call sites (`create_transaction_with_info`,
+/// `create_transaction_at_version`, `time2version`) ended up with no retry
+/// protection at all until this was pulled out.
+fn with_fdb_retry<T>(mut op: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut boff = RandomizedExponentialBackoff::default();
+    loop {
+        match op() {
+            Ok(x) => return Ok(x),
+            Err(e) if is_retryable(&e) => {
+                tracing::debug!(error = %e, "retryable FDB error, retrying");
+                boff.wait();
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Blocks the calling thread on `fut` using a minimal, runtime-agnostic
+/// executor (no Tokio task queue/scheduler) - `foundationdb`'s futures are
+/// explicitly not tied to any async runtime, so this drives them to
+/// completion the same way FDB's C/Java clients do: the calling thread parks
+/// until FDB's own completion callback wakes it directly, with no extra
+/// wake -> reschedule -> poll hop through a separate executor's run loop.
+/// This is what makes mvclient (and therefore the whole SQLite VFS path)
+/// synchronous - no `IoEngine`/Tokio runtime is needed to drive it at all.
+fn block_on<T>(fut: impl std::future::Future<Output = T>) -> T {
+    futures::executor::block_on(fut)
+}
+
 impl MultiVersionClient {
-    pub fn new(config: MultiVersionClientConfig, client: reqwest::Client) -> Result<Arc<Self>> {
-        Ok(Arc::new(Self { client, config }))
+    /// `core` is a shared FDB connection - callers should open one `Core`
+    /// per process (see `mvsqlite-core::Core::open`) and pass the same
+    /// `Arc<Core>` to every `MultiVersionClient` they construct, rather than
+    /// opening a new FDB connection per client/namespace.
+    pub fn new(config: MultiVersionClientConfig, core: Arc<Core>) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self { core, config }))
     }
 
     pub fn config(&self) -> &MultiVersionClientConfig {
         &self.config
     }
 
-    pub async fn create_transaction(self: &Arc<Self>, dp: Option<&Url>) -> Result<Transaction> {
-        self.create_transaction_with_info(dp, None)
-            .await
-            .map(|x| x.0)
+    pub fn create_transaction(self: &Arc<Self>) -> Result<Transaction> {
+        self.create_transaction_with_info(None).map(|x| x.0)
     }
 
-    pub async fn create_transaction_with_info(
+    pub fn create_transaction_with_info(
         self: &Arc<Self>,
-        dp: Option<&Url>,
         from_version: Option<&str>,
     ) -> Result<(Transaction, TransactionInfo)> {
-        let mut url = dp
-            .unwrap_or_else(|| self.config.random_data_plane())
-            .clone();
-        url.set_path("/stat");
-
-        if let Some(from_version) = from_version {
-            url.query_pairs_mut()
-                .append_pair("from_version", from_version);
-        }
-
-        if let Some(lock_owner) = &self.config.lock_owner {
-            url.query_pairs_mut().append_pair("lock_owner", lock_owner);
-        }
-
-        let mut boff = RandomizedExponentialBackoff::default();
-        let stat_res: StatResponse = loop {
-            let resp = request_and_check(self.client.get(url.clone()).decorate(self)).await?;
-            match resp {
-                Some((_, body)) => break serde_json::from_slice(&body)?,
-                None => {
-                    boff.wait().await;
-                    continue;
-                }
-            }
+        let lookup = with_fdb_retry(|| {
+            block_on(self.core.resolve_namespace_and_stat(
+                &self.config.ns_key,
+                self.config.ns_key_hashproof.as_deref(),
+                from_version.unwrap_or(""),
+                false,
+                self.config.lock_owner.as_deref().unwrap_or(""),
+            ))
+        })?;
+        let (ns_id, stat) = match lookup {
+            NamespaceLookup::Found { ns_id, stat } => (ns_id, stat),
+            NamespaceLookup::NotFound => anyhow::bail!("namespace not found"),
         };
 
         tracing::debug!(
-            version = stat_res.version,
-            metadata = stat_res.metadata,
+            version = stat.version,
+            metadata = stat.metadata,
             "created transaction"
         );
         Ok((
-            self.create_transaction_at_version(dp, &stat_res.version, stat_res.read_only),
+            self.create_transaction_with_ns_id(ns_id, &stat.version, stat.read_only),
             TransactionInfo {
-                metadata: stat_res.metadata,
-                interval: stat_res.interval,
+                metadata: stat.metadata,
+                interval: stat.interval,
             },
         ))
     }
 
-    pub fn create_transaction_at_version(
+    fn create_transaction_with_ns_id(
         self: &Arc<Self>,
-        dp: Option<&Url>,
+        ns_id: [u8; 10],
         version: &str,
         read_only: bool,
     ) -> Transaction {
-        let txn = Transaction {
+        Transaction {
             c: self.clone(),
-            dp: dp.cloned(),
+            ns_id,
             version: version.into(),
             page_buffer: HashMap::new(),
-            async_ctx: Arc::new(TxnAsyncCtx {
-                background_sem: Arc::new(Semaphore::new(32)),
-                background_completion: Arc::new(tokio::sync::RwLock::new(())),
-                has_error: AtomicBool::new(false),
-            }),
             seen_hashes: Mutex::new(HashSet::new()),
             read_only,
             read_set: None,
-        };
-
-        txn
+        }
     }
 
-    pub async fn apply_commit_intents(
+    /// Creates a transaction pinned to an already-known version, re-resolving
+    /// `ns_key` -> `ns_id` (cheaply, via `Core`'s own cache) rather than
+    /// requiring the caller to already have it.
+    pub fn create_transaction_at_version(
+        self: &Arc<Self>,
+        version: &str,
+        read_only: bool,
+    ) -> Result<Transaction> {
+        let ns_id = with_fdb_retry(|| {
+            block_on(self.core.lookup_nskey(
+                &self.config.ns_key,
+                self.config.ns_key_hashproof.as_deref(),
+            ))?
+            .with_context(|| "namespace not found")
+        })?;
+        Ok(self.create_transaction_with_ns_id(ns_id, version, read_only))
+    }
+
+    pub fn apply_commit_intents(
         &self,
-        dp: Option<&Url>,
         intents: &[NamespaceCommitIntent],
     ) -> Result<Option<CommitResult>> {
         if intents.is_empty() {
@@ -256,111 +261,120 @@ impl MultiVersionClient {
         }
 
         let start_time = Instant::now();
-        let mut url = dp
-            .unwrap_or_else(|| self.config.random_data_plane())
-            .clone();
-        url.set_path("/batch/commit");
-
         let mut idempotency_key: [u8; 16] = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut idempotency_key);
 
-        let mut boff = RandomizedExponentialBackoff::default();
-        let mut allow_skip_idempotency_check = true; // only for the first attempt
+        let total_num_pages: usize = intents.iter().map(|x| x.requests.len()).sum();
 
-        loop {
-            let global_init = CommitGlobalInit {
-                idempotency_key: &idempotency_key[..],
-                allow_skip_idempotency_check,
-                num_namespaces: intents.len(),
+        let mut ns_contexts: Vec<CommitNamespaceContext> = Vec::with_capacity(intents.len());
+        for intent in intents {
+            let mut page_writes = Vec::new();
+            let mut index_writes = Vec::with_capacity(intent.requests.len());
+            for req in &intent.requests {
+                let hash: [u8; 32] = req.hash[..]
+                    .try_into()
+                    .with_context(|| "invalid hash length")?;
+                if let Some(data) = &req.data {
+                    page_writes.push(CoreWriteRequest {
+                        data: &data[..],
+                        delta_base: Some(req.page_index),
+                    });
+                }
+                index_writes.push((req.page_index, hash));
+            }
+            ns_contexts.push(CommitNamespaceContext {
+                ns_key: intent.init.ns_key.clone(),
+                ns_id: intent.ns_id,
+                client_assumed_version: decode_version(&intent.init.version)?,
+                use_read_set: intent.init.read_set.is_some(),
+                read_set: intent.init.read_set.clone().unwrap_or_default(),
+                page_writes,
+                index_writes,
+                metadata: intent.init.metadata.clone(),
+            });
+        }
+
+        let mut is_retry = false;
+        let outcome = with_fdb_retry(|| {
+            let ctx = CommitContext {
+                idempotency_key,
+                // Skippable on the first attempt: idempotency_key is freshly
+                // random and nothing has been written under it yet, so the
+                // check is guaranteed to find nothing - paying for it would
+                // only add a round trip to the common case (PLCC already
+                // handles conflict detection on this path).
+                //
+                // NOT skippable on retry. This is a sequential gate, not a
+                // parallel fallback: each retry's transaction first checks
+                // (via a snapshot read, so it adds no new conflicts) whether
+                // our own idempotency_key already committed, and only
+                // proceeds to a normal commit if that check finds nothing.
+                // Sequential-gate is the only version of this that's
+                // actually safe - if the check and a fresh write attempt
+                // could race instead of strictly ordering, a write could
+                // land right after the check already returned "no match",
+                // silently recreating the exact bug this fixes: a retry
+                // after an ambiguous error (e.g. commit_unknown_result) that
+                // actually succeeded in FDB would create a second, real,
+                // untracked commit instead of discovering the first one
+                // already went through.
+                allow_skip_idempotency_check: !is_retry,
+                namespaces: &ns_contexts,
                 lock_owner: self.config.lock_owner.as_deref(),
             };
-            allow_skip_idempotency_check = false;
-            let mut raw_request: Vec<u8> = Vec::new();
-            {
-                let serialized = rmp_serde::to_vec_named(&global_init)?;
-                raw_request.write_u32::<BigEndian>(serialized.len() as u32)?;
-                raw_request.extend_from_slice(&serialized);
+            is_retry = true;
+            match block_on(self.core.commit(ctx))? {
+                CoreCommitResult::BadPageReference => Err(CommitError::BadPageReference.into()),
+                CoreCommitResult::NamespaceNotDistinct => {
+                    Err(CommitError::NamespaceNotDistinct.into())
+                }
+                // Committed and Conflict are both terminal, non-retryable
+                // outcomes, but not errors - resolve them through with_fdb_retry
+                // like anything else that shouldn't loop again.
+                outcome => Ok(outcome),
             }
-
-            let mut total_num_pages: usize = 0;
-
-            for intent in intents {
-                let serialized = rmp_serde::to_vec_named(&intent.init)?;
-                raw_request.write_u32::<BigEndian>(serialized.len() as u32)?;
-                raw_request.extend_from_slice(&serialized);
-                for req in &intent.requests {
-                    let serialized = rmp_serde::to_vec_named(&req)?;
-                    raw_request.write_u32::<BigEndian>(serialized.len() as u32)?;
-                    raw_request.extend_from_slice(&serialized);
-                }
-                total_num_pages += intent.requests.len();
+        })?;
+        match outcome {
+            CoreCommitResult::Committed {
+                versionstamp,
+                changelog,
+            } => {
+                let committed_version = hex::encode(&versionstamp);
+                tracing::debug!(version = committed_version, "committed transaction");
+                Ok(Some(CommitResult {
+                    version: committed_version,
+                    duration: start_time.elapsed(),
+                    num_pages: total_num_pages as u64,
+                    changelog,
+                }))
             }
-
-            let response =
-                request_and_check_returning_status(self.client.post(url.clone()).body(raw_request))
-                    .await;
-            let (headers, body) = match response {
-                Ok(Some(x)) => x,
-                Ok(None) => {
-                    boff.wait().await;
-                    continue;
-                }
-                Err(status) => {
-                    if status.as_u16() == 409 {
-                        return Ok(None);
-                    }
-                    return Err(CommitError::Status(status).into());
-                }
-            };
-            let body: CommitResponse = rmp_serde::from_slice(&body)?;
-            let committed_version = headers
-                .get("x-committed-version")
-                .with_context(|| format!("missing committed version header"))?
-                .to_str()?;
-            tracing::debug!(version = committed_version, "committed transaction");
-            return Ok(Some(CommitResult {
-                version: committed_version.into(),
-                duration: start_time.elapsed(),
-                num_pages: total_num_pages as u64,
-                changelog: body.changelog,
-            }));
+            CoreCommitResult::Conflict => Ok(None),
+            CoreCommitResult::BadPageReference | CoreCommitResult::NamespaceNotDistinct => {
+                unreachable!("returned as Err above, not Ok")
+            }
         }
     }
 
-    pub async fn time2version(
-        self: &Arc<Self>,
-        dp: Option<&Url>,
-        timestamp: u64,
-    ) -> Result<TimeToVersionResponse> {
-        let mut url = dp
-            .unwrap_or_else(|| self.config.random_data_plane())
-            .clone();
-        url.set_path("/time2version");
-        url.query_pairs_mut()
-            .append_pair("t", &timestamp.to_string());
-
-        let mut boff = RandomizedExponentialBackoff::default();
-        let res: TimeToVersionResponse = loop {
-            let resp = request_and_check(self.client.get(url.clone()).decorate(self)).await?;
-            match resp {
-                Some((_, body)) => break serde_json::from_slice(&body)?,
-                None => {
-                    boff.wait().await;
-                    continue;
-                }
-            }
-        };
-
-        Ok(res)
+    pub fn time2version(self: &Arc<Self>, timestamp: u64) -> Result<TimeToVersionResponse> {
+        let res = with_fdb_retry(|| block_on(self.core.time2version(timestamp)))?;
+        Ok(TimeToVersionResponse {
+            after: res.after.map(|x| TimeToVersionPoint {
+                version: x.version,
+                time: x.time,
+            }),
+            not_after: res.not_after.map(|x| TimeToVersionPoint {
+                version: x.version,
+                time: x.time,
+            }),
+        })
     }
 }
 
 pub struct Transaction {
     c: Arc<MultiVersionClient>,
-    dp: Option<Url>,
+    ns_id: [u8; 10],
     version: String,
     page_buffer: HashMap<u32, [u8; 32]>,
-    async_ctx: Arc<TxnAsyncCtx>,
     seen_hashes: Mutex<HashSet<[u8; 32]>>,
     read_only: bool,
     read_set: Option<Mutex<HashSet<u32>>>,
@@ -369,12 +383,6 @@ pub struct Transaction {
 pub struct TransactionInfo {
     pub metadata: String,
     pub interval: Option<Vec<u32>>,
-}
-
-struct TxnAsyncCtx {
-    background_sem: Arc<Semaphore>,
-    background_completion: Arc<tokio::sync::RwLock<()>>,
-    has_error: AtomicBool,
 }
 
 impl Transaction {
@@ -392,14 +400,6 @@ impl Transaction {
 
     pub fn written_pages(&self) -> Vec<u32> {
         self.page_buffer.keys().cloned().collect()
-    }
-
-    fn check_async_error(&self) -> Result<()> {
-        if self.async_ctx.has_error.load(Ordering::Relaxed) {
-            Err(anyhow::anyhow!("async error"))
-        } else {
-            Ok(())
-        }
     }
 
     pub fn enable_read_set(&mut self) {
@@ -429,147 +429,45 @@ impl Transaction {
         }
     }
 
-    pub async fn read_many_nomark(&self, page_id_list: &[u32]) -> Result<Vec<Vec<u8>>> {
-        // Read-your-writes: wait for completion of asynchronous writes.
-        let _ = self.async_ctx.background_completion.write().await;
-        self.check_async_error()?;
-
-        let mut raw_request: Vec<u8> = Vec::new();
-
-        let mut url = self
-            .dp
-            .as_ref()
-            .unwrap_or_else(|| self.c.config.random_data_plane())
-            .clone();
-        url.set_path("/batch/read");
-
-        for &page_index in page_id_list {
-            let buffered = self.page_buffer.get(&page_index).map(|x| x.as_slice());
-            let req = ReadRequest {
-                page_index,
-                version: self.version.as_str(),
-                hash: buffered,
-                accept_zstd: true,
-            };
-            let serialized = rmp_serde::to_vec_named(&req)?;
-            raw_request.write_u32::<BigEndian>(serialized.len() as u32)?;
-            raw_request.extend_from_slice(&serialized);
-        }
-        let raw_request = Bytes::from(raw_request);
-        let mut boff = RandomizedExponentialBackoff::default();
-        loop {
-            let response = request_and_check(
-                self.c
-                    .client
-                    .post(url.clone())
-                    .decorate(&self.c)
-                    .body(raw_request.clone()),
-            )
-            .await?;
-            let (_, raw_response) = match response {
-                Some(x) => x,
-                None => {
-                    boff.wait().await;
-                    continue;
+    pub fn read_many_nomark(&self, page_id_list: &[u32]) -> Result<Vec<Vec<u8>>> {
+        let core = &self.c.core;
+        let results = block_on(async {
+            let futs = page_id_list.iter().map(|&page_index| {
+                let hash = self.page_buffer.get(&page_index).copied();
+                let version = self.version.as_str();
+                async move {
+                    core.read_page(
+                        self.ns_id,
+                        ReadPageRequest {
+                            page_index,
+                            version,
+                            hash,
+                        },
+                    )
+                    .await
                 }
-            };
-            let mut raw_response = &raw_response[..];
-            let mut out: Vec<Vec<u8>> = Vec::with_capacity(page_id_list.len());
-            while !raw_response.is_empty() {
-                let len = raw_response.read_u32::<BigEndian>()? as usize;
-                let serialized = &raw_response[..len];
-                raw_response = &raw_response[len..];
+            });
+            futures::future::try_join_all(futs).await
+        })?;
 
-                let data: ReadResponse = rmp_serde::from_slice(serialized)?;
-
-                let payload = if data.zstd {
-                    zstd::bulk::decompress(data.data, 1048576)?
-                } else {
-                    data.data.to_vec()
-                };
-                out.push(payload);
-                self.seen_hashes
-                    .lock()
-                    .unwrap()
-                    .insert(*blake3::hash(&data.data).as_bytes());
-            }
-
-            if out.len() != page_id_list.len() {
-                tracing::error!("response length mismatch, retrying");
-                boff.wait().await;
-                continue;
-            }
-            return Ok(out);
+        let mut out = Vec::with_capacity(results.len());
+        for page in results {
+            let data = page.map(|x| x.data.to_vec()).unwrap_or_default();
+            self.seen_hashes
+                .lock()
+                .unwrap()
+                .insert(*blake3::hash(&data).as_bytes());
+            out.push(data);
         }
+        Ok(out)
     }
 
-    async fn bg_write_task(
-        dp: Option<Url>,
-        c: Arc<MultiVersionClient>,
-        _completion_guard: OwnedRwLockReadGuard<()>,
-        _sem_permit: OwnedSemaphorePermit,
-        async_ctx: Arc<TxnAsyncCtx>,
-        raw_request: Bytes,
-        num_pages: usize,
-    ) {
-        if async_ctx.has_error.load(Ordering::Relaxed) {
-            return;
-        }
-
-        let mut url = dp.unwrap_or_else(|| c.config.random_data_plane().clone());
-        url.set_path("/batch/write");
-
-        let mut boff = RandomizedExponentialBackoff::default();
-        loop {
-            let response = match request_and_check(
-                c.client
-                    .post(url.clone())
-                    .decorate(&c)
-                    .body(raw_request.clone()),
-            )
-            .await
-            {
-                Ok(x) => x,
-                Err(e) => {
-                    tracing::error!(error = %e, "background page write failed");
-                    async_ctx.has_error.store(true, Ordering::Relaxed);
-                    return;
-                }
-            };
-            let (_, raw_response) = match response {
-                Some(x) => x,
-                None => {
-                    boff.wait().await;
-                    continue;
-                }
-            };
-            let mut raw_response = &raw_response[..];
-            let mut counter: usize = 0;
-            while !raw_response.is_empty() {
-                let len = raw_response.read_u32::<BigEndian>().unwrap_or(0) as usize;
-                let serialized = &raw_response[..len];
-                raw_response = &raw_response[len..];
-                let data: WriteResponse = match rmp_serde::from_slice(serialized) {
-                    Ok(x) => x,
-                    Err(e) => {
-                        tracing::error!(error = %e, "background page write could not decode server response");
-                        async_ctx.has_error.store(true, Ordering::Relaxed);
-                        return;
-                    }
-                };
-
-                if data.hash.is_empty() {
-                    assert_eq!(counter, num_pages);
-                    return;
-                }
-                counter += 1;
-            }
-            tracing::error!("incomplete write, retrying");
-            boff.wait().await;
-        }
-    }
-
-    pub async fn write_many(&mut self, raw_pages: &[(u32, &[u8])]) -> Result<()> {
+    /// Applies a batch of page writes immediately (synchronously) rather than
+    /// backgrounding it - Direct-mode FDB writes are cheap enough (no HTTP
+    /// round trip) that the old "background the write, synchronize before the
+    /// next read/commit" pattern (which existed to hide HTTP latency) is no
+    /// longer worth the extra bookkeeping it required.
+    pub fn write_many(&mut self, raw_pages: &[(u32, &[u8])]) -> Result<()> {
         let all_pages = raw_pages
             .iter()
             .map(|&(page_index, data)| {
@@ -577,64 +475,41 @@ impl Transaction {
                 (page_index, data, hash)
             })
             .collect::<Vec<_>>();
-        let pages_to_push = all_pages
+        let pages_to_push: Vec<(&[u8], u32)> = all_pages
             .iter()
             .filter(|(_, _, hash)| !self.seen_hashes.lock().unwrap().contains(hash.as_bytes()))
-            .collect::<Vec<_>>();
-        let mut raw_request: Vec<u8> = Vec::new();
-        for &(page_index, data, _) in &pages_to_push {
-            let req = WriteRequest {
-                data,
-                delta_base: Some(*page_index),
-            };
-            let serialized = rmp_serde::to_vec_named(&req)?;
-            raw_request.write_u32::<BigEndian>(serialized.len() as u32)?;
-            raw_request.extend_from_slice(&serialized);
-        }
+            .map(|(page_index, data, _)| (*data, *page_index))
+            .collect();
 
-        // Finalization frame
-        raw_request.write_u32::<BigEndian>(0)?;
-
-        let raw_request = Bytes::from(raw_request);
         for (page_index, _, hash) in &all_pages {
             self.page_buffer.insert(*page_index, *hash.as_bytes());
             self.seen_hashes.lock().unwrap().insert(*hash.as_bytes());
         }
-        let completion_guard = self
-            .async_ctx
-            .background_completion
-            .clone()
-            .read_owned()
-            .await;
-        let sem_permit = self
-            .async_ctx
-            .background_sem
-            .clone()
-            .acquire_owned()
-            .await
+
+        if pages_to_push.is_empty() {
+            return Ok(());
+        }
+
+        let reqs: Vec<CoreWriteRequest> = pages_to_push
+            .iter()
+            .map(|(data, page_index)| CoreWriteRequest {
+                data,
+                delta_base: Some(*page_index),
+            })
+            .collect();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap();
-        let async_ctx = self.async_ctx.clone();
-        tokio::spawn(Self::bg_write_task(
-            self.dp.clone(),
-            self.c.clone(),
-            completion_guard,
-            sem_permit,
-            async_ctx,
-            raw_request,
-            pages_to_push.len(),
-        ));
+
+        with_fdb_retry(|| block_on(self.c.core.write_pages(self.ns_id, now, &reqs)))?;
         Ok(())
     }
 
-    pub async fn commit_intent(
+    pub fn commit_intent(
         &self,
         metadata: Option<String>,
         fast_writes: &HashMap<u32, Bytes>,
     ) -> Result<Option<NamespaceCommitIntent>> {
-        // Wait for all pages in the page buffer to be flushed.
-        let _ = self.async_ctx.background_completion.write().await;
-        self.check_async_error()?;
-
         if self.page_buffer.is_empty() && metadata.is_none() && fast_writes.is_empty() {
             return Ok(None);
         }
@@ -642,6 +517,7 @@ impl Transaction {
         let total_num_pages = self.page_buffer.len() + fast_writes.len();
 
         let mut out = NamespaceCommitIntent {
+            ns_id: self.ns_id,
             init: CommitNamespaceInit {
                 version: self.version.clone(),
                 metadata,
@@ -678,89 +554,18 @@ impl Transaction {
         Ok(Some(out))
     }
 
-    pub async fn commit(
+    pub fn commit(
         self,
         metadata: Option<&str>,
         fast_writes: &HashMap<u32, Bytes>,
     ) -> Result<CommitOutput> {
-        let intent = match self
-            .commit_intent(metadata.map(|x| x.to_string()), fast_writes)
-            .await?
-        {
+        let intent = match self.commit_intent(metadata.map(|x| x.to_string()), fast_writes)? {
             Some(x) => x,
             None => return Ok(CommitOutput::Empty),
         };
-        Ok(
-            match self
-                .c
-                .apply_commit_intents(self.dp.as_ref(), &[intent])
-                .await?
-            {
-                Some(x) => CommitOutput::Committed(x),
-                None => CommitOutput::Conflict,
-            },
-        )
-    }
-}
-
-#[derive(Error, Debug)]
-#[error("status {0}")]
-pub struct StatusCodeError(pub StatusCode);
-
-async fn request_and_check(r: RequestBuilder) -> Result<Option<(HeaderMap, Bytes)>> {
-    request_and_check_returning_status(r)
-        .await
-        .map_err(StatusCodeError)
-        .map_err(anyhow::Error::from)
-}
-
-async fn request_and_check_returning_status(
-    r: RequestBuilder,
-) -> Result<Option<(HeaderMap, Bytes)>, StatusCode> {
-    let res = match r.send().await {
-        Ok(x) => x,
-        Err(e) => {
-            tracing::error!(error = %e, "network error");
-            return Ok(None);
-        }
-    };
-    if res.status().is_success() {
-        let headers = res.headers().clone();
-        let body = match res.bytes().await {
-            Ok(x) => x,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to read response body");
-                return Ok(None);
-            }
-        };
-        Ok(Some((headers, body)))
-    } else if res.status().is_server_error() {
-        let status = res.status();
-        let text = res.text().await.unwrap_or_default();
-        tracing::error!(status = %status, text = text, "server error");
-        Ok(None)
-    } else {
-        let status = res.status();
-        let text = res.text().await.unwrap_or_default();
-        tracing::warn!(status = %status, text = %text, "client error");
-        Err(status)
-    }
-}
-
-trait DecorateRequest {
-    fn decorate(self, c: &MultiVersionClient) -> RequestBuilder;
-}
-
-impl DecorateRequest for RequestBuilder {
-    fn decorate(self, c: &MultiVersionClient) -> RequestBuilder {
-        let mut me = self.header(
-            "x-namespace-key",
-            HeaderValue::from_str(&c.config.ns_key).unwrap(),
-        );
-
-        if let Some(x) = &c.config.ns_key_hashproof {
-            me = me.header("x-namespace-hashproof", HeaderValue::from_str(x).unwrap())
-        }
-        me
+        Ok(match self.c.apply_commit_intents(&[intent])? {
+            Some(x) => CommitOutput::Committed(x),
+            None => CommitOutput::Conflict,
+        })
     }
 }

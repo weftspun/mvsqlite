@@ -1,7 +1,6 @@
-use std::{io::ErrorKind, sync::Arc};
+use std::io::ErrorKind;
 
 use crate::{
-    io_engine::IoEngine,
     sqlite_vfs::{wip::WalIndex, DatabaseHandle, LockKind, OpenKind, Vfs, WalDisabled},
     tempfile::TempFile,
 };
@@ -9,14 +8,7 @@ use crate::{
 pub use mvfs::vfs::{PAGE_CACHE_SIZE, PREFETCH_DEPTH, WRITE_CHUNK_SIZE};
 
 pub struct MultiVersionVfs {
-    pub io: AbstractIoEngine,
     pub inner: mvfs::MultiVersionVfs,
-}
-
-#[derive(Clone)]
-pub enum AbstractIoEngine {
-    Prebuilt(Arc<IoEngine>),
-    Builder(Arc<Box<dyn Fn() -> Arc<IoEngine> + Send + Sync + 'static>>),
 }
 
 impl Vfs for MultiVersionVfs {
@@ -35,13 +27,7 @@ impl Vfs for MultiVersionVfs {
             .inner
             .open(db, true)
             .map_err(|e| std::io::Error::new(ErrorKind::Other, e))?;
-        Ok(Box::new(Connection {
-            io: match &self.io {
-                AbstractIoEngine::Prebuilt(io) => io.clone(),
-                AbstractIoEngine::Builder(io) => io(),
-            },
-            inner: conn,
-        }))
+        Ok(Box::new(Connection { inner: conn }))
     }
 
     fn delete(&self, db: &str) -> Result<(), std::io::Error> {
@@ -63,10 +49,7 @@ impl Vfs for MultiVersionVfs {
     }
 
     fn sleep(&self, duration: std::time::Duration) -> std::time::Duration {
-        match &self.io {
-            AbstractIoEngine::Prebuilt(io) => io.run(tokio::time::sleep(duration)),
-            _ => std::thread::sleep(duration),
-        }
+        std::thread::sleep(duration);
         duration
     }
 
@@ -76,7 +59,6 @@ impl Vfs for MultiVersionVfs {
 }
 
 pub struct Connection {
-    pub io: Arc<IoEngine>,
     pub inner: mvfs::Connection,
 }
 
@@ -84,17 +66,15 @@ impl DatabaseHandle for Connection {
     type WalIndex = WalDisabled;
 
     fn size(&mut self) -> Result<u64, std::io::Error> {
-        self.io.run(async { self.inner.size().await })
+        self.inner.size()
     }
 
     fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
-        self.io
-            .run(async { self.inner.read_exact_at(buf, offset).await })
+        self.inner.read_exact_at(buf, offset)
     }
 
     fn write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<(), std::io::Error> {
-        self.io
-            .run(async { self.inner.write_all_at(buf, offset).await })
+        self.inner.write_all_at(buf, offset)
     }
 
     fn sync(&mut self, _data_only: bool) -> Result<(), std::io::Error> {
@@ -106,11 +86,11 @@ impl DatabaseHandle for Connection {
     }
 
     fn lock(&mut self, lock: LockKind) -> Result<bool, std::io::Error> {
-        self.io.run(async { self.inner.lock(lock.into()).await })
+        self.inner.lock(lock.into())
     }
 
     fn unlock(&mut self, lock: LockKind) -> Result<bool, std::io::Error> {
-        self.io.run(async { self.inner.unlock(lock.into()).await })
+        self.inner.unlock(lock.into())
     }
 
     fn commit_phasetwo(&mut self) {

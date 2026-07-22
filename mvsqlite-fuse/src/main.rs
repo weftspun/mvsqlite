@@ -12,7 +12,8 @@ use indexmap::IndexMap;
 
 use anyhow::Result;
 use backtrace::Backtrace;
-use mvfs::{types::LockKind, vfs::AbstractHttpClient, Connection};
+use mvfs::{types::LockKind, vfs::AbstractCore, Connection};
+use mvsqlite_core::{Core, CoreConfig};
 use slab::Slab;
 use clap::Parser;
 use tokio::sync::Mutex;
@@ -43,9 +44,21 @@ fn parse_db_name(name: &str) -> Option<DbName> {
 #[derive(Debug, Parser)]
 #[clap(name = "mvsqlite-fuse", about = "mvsqlite fuse")]
 struct Opt {
-    /// Data plane URL.
-    #[clap(long, env = "MVSQLITE_FUSE_DATA_PLANE")]
-    data_plane: String,
+    /// Path to FoundationDB cluster file.
+    #[clap(
+        long,
+        default_value = "/etc/foundationdb/fdb.cluster",
+        env = "MVSQLITE_FUSE_FDB_CLUSTER"
+    )]
+    fdb_cluster: String,
+
+    /// Data prefix. This value is NOT tuple-encoded, for maximum efficiency.
+    #[clap(long, env = "MVSQLITE_FUSE_RAW_DATA_PREFIX")]
+    raw_data_prefix: String,
+
+    /// Metadata prefix. This value is tuple-encoded as a string.
+    #[clap(long, env = "MVSQLITE_FUSE_METADATA_PREFIX")]
+    metadata_prefix: String,
 
     /// Comma-separated namespace mappings: file1=ns1,file2=ns2
     #[clap(long, env = "MVSQLITE_FUSE_NAMESPACES")]
@@ -66,6 +79,10 @@ struct Opt {
     /// Allow root.
     #[clap(long)]
     allow_root: bool,
+
+    /// Auto create namespaces on request.
+    #[clap(long)]
+    auto_create_namespace: bool,
 }
 
 #[tokio::main]
@@ -91,10 +108,23 @@ async fn main() -> Result<()> {
         })
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect::<IndexMap<_, _>>();
+
+    mvsqlite_core::boot::boot();
+    let core = Core::open(CoreConfig {
+        cluster: opt.fdb_cluster.clone(),
+        raw_data_prefix: opt.raw_data_prefix.clone(),
+        metadata_prefix: opt.metadata_prefix.clone(),
+        read_only: false,
+        dr_tag: String::from("default"),
+        content_cache_size: 0,
+        auto_create_ns: opt.auto_create_namespace,
+    })
+    .await
+    .expect("failed to open FDB core");
+
     let vfs = mvfs::MultiVersionVfs {
-        data_plane: opt.data_plane.clone(),
+        core: AbstractCore::Prebuilt(Arc::new(core)),
         sector_size: opt.sector_size,
-        http_client: AbstractHttpClient::Prebuilt(reqwest::Client::new()),
         db_name_map: Arc::new(Default::default()),
         lock_owner: None,
         fork_tolerant: false,
@@ -175,9 +205,9 @@ impl FuseFs {
             let current = conn.current_lock();
             tracing::debug!(ns = ns_name, ?current, ?desired, "lock_bookkeeping");
             let result = if desired.level() > current.level() {
-                conn.lock(desired).await
+                conn.lock(desired)
             } else if desired.level() < current.level() {
-                conn.unlock(desired).await
+                conn.unlock(desired)
             } else {
                 Ok(true)
             };
@@ -476,13 +506,10 @@ impl fuser::Filesystem for FuseFs {
         tokio::spawn(async move {
             let mut conn = conn.lock().await;
             let mut buf = vec![0u8; sector_size];
-            match conn
-                .read_exact_at(
-                    &mut buf,
-                    (offset as u64 / sector_size as u64) * sector_size as u64,
-                )
-                .await
-            {
+            match conn.read_exact_at(
+                &mut buf,
+                (offset as u64 / sector_size as u64) * sector_size as u64,
+            ) {
                 Ok(()) => {
                     reply.data(fixup_read_shift(offset, size, &buf));
                 }
@@ -535,7 +562,7 @@ impl fuser::Filesystem for FuseFs {
         let data = data.to_vec();
         tokio::spawn(async move {
             let mut conn = conn.lock().await;
-            match conn.write_all_at(&data, offset as u64).await {
+            match conn.write_all_at(&data, offset as u64) {
                 Ok(()) => {
                     reply.written(data.len() as _);
                 }
@@ -619,7 +646,7 @@ impl fuser::Filesystem for FuseFs {
             let conn = conn.clone();
             tokio::spawn(async move {
                 let mut conn = conn.lock().await;
-                match conn.size().await {
+                match conn.size() {
                     Ok(x) => {
                         attr.ino = fakeino;
                         attr.size = x;

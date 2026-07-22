@@ -4,7 +4,6 @@ members = [
     "mvsqlite-core",
     "mvsqlite-verify-ffi",
     "mvsqlite-fuse",
-    "mvstore",
     "mvstore-stress",
     "mvclient",
     "mvfs",

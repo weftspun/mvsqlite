@@ -1,20 +1,17 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use bytes::Bytes;
 use moka::sync::Cache;
-use reqwest::Url;
+use mvsqlite_core::{Core, CoreConfig};
 use std::{
     collections::{HashMap, HashSet},
     io::ErrorKind,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 
-use mvclient::{
-    CommitOutput, MultiVersionClient, MultiVersionClientConfig, StatusCodeError,
-    TimeToVersionResponse, Transaction,
-};
+use mvclient::{CommitOutput, MultiVersionClient, MultiVersionClientConfig, TimeToVersionResponse, Transaction};
 
 use crate::types::LockKind;
 const TRANSITION_HISTORY_SIZE: usize = 10;
@@ -26,16 +23,62 @@ pub static PAGE_CACHE_SIZE: AtomicUsize = AtomicUsize::new(5000);
 pub static WRITE_CHUNK_SIZE: AtomicUsize = AtomicUsize::new(10);
 pub static PREFETCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
+/// A shared FDB connection, built either eagerly or lazily on first use.
+///
+/// `Lazy` exists for fork-tolerant processes: FDB's C client cannot safely
+/// continue operating in a forked child once the network thread has already
+/// started in the parent (see `mvsqlite_core::boot`'s doc comment), so if the
+/// process might fork, the actual `Core::open` (and FDB network boot) must be
+/// deferred until first real use *within each process* - as long as forking
+/// always happens before that first use, each child resolves its own
+/// independent `Core`. Forking *after* the `Core` has already been resolved
+/// in the parent is unsafe with FDB's client, no matter how this is built.
 #[derive(Clone)]
-pub enum AbstractHttpClient {
-    Prebuilt(reqwest::Client),
-    Builder(Arc<Box<dyn Fn() -> reqwest::Client + Send + Sync + 'static>>),
+pub enum AbstractCore {
+    Prebuilt(Arc<Core>),
+    Lazy(Arc<LazyCore>),
+}
+
+impl AbstractCore {
+    fn resolve(&self) -> Result<Arc<Core>> {
+        match self {
+            AbstractCore::Prebuilt(core) => Ok(core.clone()),
+            AbstractCore::Lazy(lazy) => lazy.resolve(),
+        }
+    }
+}
+
+pub struct LazyCore {
+    config: CoreConfig,
+    cell: Mutex<Option<Arc<Core>>>,
+}
+
+impl LazyCore {
+    pub fn new(config: CoreConfig) -> Self {
+        Self {
+            config,
+            cell: Mutex::new(None),
+        }
+    }
+
+    fn resolve(&self) -> Result<Arc<Core>> {
+        let mut guard = self.cell.lock().unwrap();
+        if let Some(core) = &*guard {
+            return Ok(core.clone());
+        }
+        mvsqlite_core::boot::boot();
+        // See mvclient's `block_on` doc comment: FDB's futures aren't tied to
+        // any async runtime, so a minimal executor is enough here too - no
+        // Tokio runtime needs to exist in this process at all.
+        let core = Arc::new(futures::executor::block_on(Core::open(self.config.clone()))?);
+        *guard = Some(core.clone());
+        Ok(core)
+    }
 }
 
 pub struct MultiVersionVfs {
-    pub data_plane: String,
+    pub core: AbstractCore,
     pub sector_size: usize,
-    pub http_client: AbstractHttpClient,
     pub db_name_map: Arc<HashMap<String, String>>,
     pub lock_owner: Option<String>,
     pub fork_tolerant: bool,
@@ -49,13 +92,6 @@ impl MultiVersionVfs {
             }
         }
 
-        let (dp, db) = if db.starts_with("http://") || db.starts_with("https://") {
-            let url = Url::parse(db)?;
-            let dp = Url::parse(&url.origin().ascii_serialization())?;
-            (Some(dp), url.path().to_string())
-        } else {
-            (None, db.to_string())
-        };
         let db = db.trim_start_matches("/");
 
         let db_str_segs = db.split("@").collect::<Vec<_>>();
@@ -91,23 +127,11 @@ impl MultiVersionVfs {
 
         let client = MultiVersionClient::new(
             MultiVersionClientConfig {
-                data_plane: self
-                    .data_plane
-                    .split(",")
-                    .map(|s| {
-                        s.parse()
-                            .with_context(|| format!("failed to parse data plane address: {}", s))
-                    })
-                    .collect::<Result<Vec<_>>>()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
                 ns_key: ns_key.to_string(),
                 ns_key_hashproof,
                 lock_owner: self.lock_owner.clone(),
             },
-            match &self.http_client {
-                AbstractHttpClient::Prebuilt(c) => c.clone(),
-                AbstractHttpClient::Builder(f) => f(),
-            },
+            self.core.resolve()?,
         )?;
 
         let first_page = match self.sector_size {
@@ -120,7 +144,6 @@ impl MultiVersionVfs {
 
         let conn = Connection {
             client,
-            dp,
             fixed_version,
             txn: None,
             lock: LockKind::None,
@@ -146,7 +169,6 @@ impl MultiVersionVfs {
 
 pub struct Connection {
     client: Arc<MultiVersionClient>,
-    dp: Option<Url>,
     fixed_version: Option<String>,
     txn: Option<Transaction>,
     lock: LockKind,
@@ -223,7 +245,7 @@ impl Connection {
         self.last_known_write_version.as_deref()
     }
 
-    pub async fn do_read_raw(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
+    pub fn do_read_raw(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
         assert!(offset as usize % self.sector_size == 0);
         assert!(buf.len() == self.sector_size);
 
@@ -280,7 +302,6 @@ impl Connection {
 
         let pages = txn
             .read_many_nomark(&read_vec)
-            .await
             .expect("unrecoverable read failure");
         assert_eq!(pages.len(), 1 + predicted_next.len());
         let page = &pages[0];
@@ -323,8 +344,8 @@ impl Connection {
         self.page_cache.insert(page_index, buf);
     }
 
-    pub async fn do_read(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
-        self.do_read_raw(buf, offset).await?;
+    pub fn do_read(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
+        self.do_read_raw(buf, offset)?;
         if offset == 0 {
             buf[24..28].copy_from_slice(&self.virtual_version_counter.to_be_bytes());
             buf[92..96].copy_from_slice(&self.virtual_version_counter.to_be_bytes());
@@ -332,7 +353,7 @@ impl Connection {
         Ok(())
     }
 
-    pub async fn force_flush_write_buffer(&mut self) {
+    pub fn force_flush_write_buffer(&mut self) {
         let txn = self.txn.as_mut().unwrap();
 
         if self.write_buffer.is_empty() {
@@ -344,23 +365,21 @@ impl Connection {
 
         for chunk in entries.chunks(WRITE_CHUNK_SIZE.load(Ordering::Relaxed)) {
             txn.write_many(chunk)
-                .await
                 .expect("unrecoverable write failure")
         }
         self.write_buffer.clear();
     }
 
-    pub async fn maybe_flush_write_buffer(&mut self) {
+    pub fn maybe_flush_write_buffer(&mut self) {
         if self.write_buffer.len() >= 1000 {
-            self.force_flush_write_buffer().await;
+            self.force_flush_write_buffer();
         }
     }
 
-    pub async fn time2version(&mut self, timestamp: u64) -> TimeToVersionResponse {
+    pub fn time2version(&mut self, timestamp: u64) -> TimeToVersionResponse {
         let res = self
             .client
-            .time2version(self.dp.as_ref(), timestamp)
-            .await
+            .time2version(timestamp)
             .expect("unrecoverable time2version failure");
         res
     }
@@ -383,9 +402,9 @@ impl Connection {
         Ok(())
     }
 
-    async fn finalize_transaction(&mut self, commit: bool) -> bool {
+    fn finalize_transaction(&mut self, commit: bool) -> bool {
         if self.write_buffer.len() > WRITE_CHUNK_SIZE.load(Ordering::Relaxed) {
-            self.force_flush_write_buffer().await;
+            self.force_flush_write_buffer();
         }
 
         let mut txn = self
@@ -433,7 +452,7 @@ impl Connection {
         }
 
         let fast_write_size = self.write_buffer.len();
-        let result = txn.commit(None, &self.write_buffer).await;
+        let result = txn.commit(None, &self.write_buffer);
         self.write_buffer.clear();
 
         let result = result.expect("transaction commit failed");
@@ -459,11 +478,11 @@ impl Connection {
                     tracing::warn!("non-local concurrent transaction detected, invalidating cache");
                 }
 
-                self.txn = Some(self.client.create_transaction_at_version(
-                    self.dp.as_ref(),
-                    &result.version,
-                    false,
-                ));
+                self.txn = Some(
+                    self.client
+                        .create_transaction_at_version(&result.version, false)
+                        .expect("unrecoverable transaction re-creation failure"),
+                );
 
                 tracing::info!(
                         version = result.version,
@@ -483,11 +502,11 @@ impl Connection {
             }
             CommitOutput::Empty => {
                 tracing::info!("transaction is empty");
-                self.txn = Some(self.client.create_transaction_at_version(
-                    self.dp.as_ref(),
-                    &read_version,
-                    false,
-                ));
+                self.txn = Some(
+                    self.client
+                        .create_transaction_at_version(&read_version, false)
+                        .expect("unrecoverable transaction re-creation failure"),
+                );
                 true
             }
         }
@@ -495,20 +514,20 @@ impl Connection {
 }
 
 impl Connection {
-    pub async fn size(&mut self) -> Result<u64, std::io::Error> {
+    pub fn size(&mut self) -> Result<u64, std::io::Error> {
         if self.txn.is_none() {
             tracing::warn!("file_size called without a transaction");
             return Ok(self.sector_size as _);
         }
         let mut pzero = vec![0u8; self.sector_size];
-        self.read_exact_at(&mut pzero, 0).await?;
+        self.read_exact_at(&mut pzero, 0)?;
         let num_pages = u32::from_be_bytes(pzero[28..32].try_into().unwrap());
         tracing::debug!(num_pages, "db size");
         let size = self.sector_size as u64 * num_pages as u64;
         Ok(size)
     }
 
-    pub async fn read_exact_at(
+    pub fn read_exact_at(
         &mut self,
         buf: &mut [u8],
         offset: u64,
@@ -537,15 +556,15 @@ impl Connection {
                 "unexpected read"
             );
             let mut page_buf = vec![0; self.sector_size];
-            self.do_read(&mut page_buf, 0).await?;
+            self.do_read(&mut page_buf, 0)?;
             buf.copy_from_slice(&page_buf[offset as usize..offset as usize + buf.len()]);
             return Ok(());
         }
 
-        self.do_read(buf, offset).await
+        self.do_read(buf, offset)
     }
 
-    pub async fn write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<(), std::io::Error> {
+    pub fn write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<(), std::io::Error> {
         assert!(offset as usize % self.sector_size == 0);
         assert!(buf.len() == self.sector_size);
 
@@ -593,12 +612,12 @@ impl Connection {
         self.insert_to_page_cache(page_offset as u32, buf.clone());
         self.write_buffer.insert(page_offset as u32, buf);
 
-        self.maybe_flush_write_buffer().await;
+        self.maybe_flush_write_buffer();
 
         Ok(())
     }
 
-    pub async fn lock(&mut self, lock: LockKind) -> Result<bool, std::io::Error> {
+    pub fn lock(&mut self, lock: LockKind) -> Result<bool, std::io::Error> {
         tracing::trace!(lock = ?lock, "lock");
         assert!(lock != LockKind::None);
         if self.lock == lock {
@@ -609,17 +628,13 @@ impl Connection {
             let mut interval: Option<Vec<u32>> = None;
 
             let txn_info = if let Some(version) = &self.fixed_version {
-                Ok(self
-                    .client
-                    .create_transaction_at_version(self.dp.as_ref(), version, true))
+                self.client
+                    .create_transaction_at_version(version, true)
             } else {
                 let client = self.client.clone();
-                let res = client
-                    .create_transaction_with_info(
-                        self.dp.as_ref(),
-                        self.last_known_write_version.as_ref().map(|x| x.as_str()),
-                    )
-                    .await;
+                let res = client.create_transaction_with_info(
+                    self.last_known_write_version.as_ref().map(|x| x.as_str()),
+                );
                 match res {
                     Ok((txn, info)) => {
                         interval = info.interval;
@@ -632,18 +647,6 @@ impl Connection {
                 Ok(x) => x,
                 Err(e) => {
                     tracing::error!(ns_key = self.client.config().ns_key, error = %e, "transaction initialization failed");
-
-                    if let Some(sc_err) =
-                        e.chain().find_map(|x| x.downcast_ref::<StatusCodeError>())
-                    {
-                        if sc_err.0.as_u16() == 410 {
-                            tracing::error!(
-                                "this client can no longer start transaction on this database"
-                            );
-                            return Err(std::io::Error::new(std::io::ErrorKind::Other, "error"));
-                        }
-                    }
-
                     return Ok(false);
                 }
             };
@@ -684,7 +687,7 @@ impl Connection {
         Ok(true)
     }
 
-    pub async fn unlock(&mut self, lock: LockKind) -> Result<bool, std::io::Error> {
+    pub fn unlock(&mut self, lock: LockKind) -> Result<bool, std::io::Error> {
         tracing::trace!(lock = ?lock, "unlock");
 
         if lock == self.lock {
@@ -697,7 +700,7 @@ impl Connection {
         let commit_ok = if prev_lock.level() >= reserved_level && lock.level() < reserved_level {
             let commit_confirmed = self.commit_confirmed;
             self.commit_confirmed = false;
-            self.finalize_transaction(commit_confirmed).await
+            self.finalize_transaction(commit_confirmed)
         } else {
             true
         };

@@ -29,14 +29,19 @@ status
 
 ## Start sqlite client
 
+mvSQLite's SQLite VFS talks to FoundationDB directly - there's no server process to run, just environment variables pointing at the cluster file and namespace prefixes.
+
 ```cmd
 set RUST_LOG=info
-set MVSQLITE_DATA_PLANE=http://localhost:7000
+set MVSQLITE_FDB_CLUSTER=C:/ProgramData/foundationdb/fdb.cluster
+set MVSQLITE_METADATA_PREFIX=mvsqlite
+set MVSQLITE_RAW_DATA_PREFIX=m
+set MVSQLITE_AUTO_CREATE_NAMESPACE=1
 sqlite3.exe mvsqlite
 .tables
 ```
 
-## Starting mvstore with foundationdb on Linux
+## Installing foundationdb on Linux
 
 ```bash
 # on Linux
@@ -44,23 +49,14 @@ wget https://github.com/apple/foundationdb/releases/download/7.1.15/foundationdb
 sudo dpkg -i foundationdb-clients_7.1.15-1_amd64.deb
 wget https://github.com/apple/foundationdb/releases/download/7.1.15/foundationdb-server_7.1.15-1_amd64.deb
 sudo dpkg -i foundationdb-server_7.1.15-1_amd64.deb
-cargo build --release -p mvstore
-RUST_LOG=info ./mvstore \
-  --data-plane 127.0.0.1:7000 \
-  --admin-api 127.0.0.1:7001 \
-  --metadata-prefix mvstore \
-  --raw-data-prefix m
 ```
 
-## Starting mvstore with foundationdb on Windows
+## Installing foundationdb on Windows
 
 ```bash
 cmd
 REM install https://github.com/apple/foundationdb/releases/download/7.1.25/foundationdb-7.1.25-x64.msi
 REM Copy fdb_c_types.h
-cargo build --release -p mvstore
-$env:RUST_LOG="info"
-./mvstore.exe --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore --raw-data-prefix m --cluster "C:/ProgramData/foundationdb/fdb.cluster"
 ```
 
 ## Copy fdb_c_types.h to `C:/Program Files/foundationdb/include/foundationdb/fdb_c_types.h`
@@ -117,10 +113,7 @@ typedef int fdb_bool_t;
 
 ## Create a mvsqlite database
 
-```bat
-scoop install curl
-curl http://localhost:7001/api/create_namespace --include --data {\"key\":\"mvsqlite\"}
-```
+Set `MVSQLITE_AUTO_CREATE_NAMESPACE=1` (see above) and the namespace is created automatically the first time it's opened - no separate admin API call needed.
 
 ## Debugging library loading
 
