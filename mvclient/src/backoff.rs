@@ -41,7 +41,7 @@ impl RandomizedExponentialBackoff {
         dur
     }
 
-    pub async fn wait(&mut self) {
-        tokio::time::sleep(self.next()).await;
+    pub fn wait(&mut self) {
+        std::thread::sleep(self.next());
     }
 }

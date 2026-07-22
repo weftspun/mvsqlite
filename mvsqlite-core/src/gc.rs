@@ -11,20 +11,110 @@ use bloom::{BloomFilter, ASMS};
 use foundationdb::{future::FdbKeyValue, options::StreamingMode, RangeOption};
 use futures::TryStreamExt;
 
-use mvsqlite_core::{
+use crate::{
     fixed::FixedKeyVec,
+    lock::DistributedLock,
     util::{
         add_single_key_read_conflict_range, decode_version, extract_10_byte_suffix,
         get_txn_read_version_as_versionstamp, truncate_10_byte_suffix, ContentIndex,
     },
+    Core,
 };
-
-use crate::{lock::DistributedLock, server::Server};
 
 pub static GC_SCAN_BATCH_SIZE: AtomicUsize = AtomicUsize::new(5000);
 pub static GC_FRESH_PAGE_TTL_SECS: AtomicU64 = AtomicU64::new(3600);
+/// How long a commit's idempotency record (see
+/// `KeyCodec::construct_idempotency_record_key`) survives before
+/// `sweep_idempotency_records` may delete it. Default 24 hours, matching
+/// industry practice for this exact pattern (e.g. Stripe prunes idempotency
+/// keys after 24h) - deliberately a long horizon, not a short TTL tied to
+/// how long a client might plausibly still be retrying: the record is tiny,
+/// the sweep is async and off the hot path, and a long horizon costs
+/// nothing but a little storage in exchange for never being the thing that
+/// silently reopens the phantom-commit hole because a slow client's retry
+/// arrived just after cleanup.
+pub static IDEMPOTENCY_RECORD_TTL_SECS: AtomicU64 = AtomicU64::new(86400);
 
-impl Server {
+impl Core {
+    /// Deletes idempotency records (see
+    /// `KeyCodec::construct_idempotency_record_key`) older than
+    /// `IDEMPOTENCY_RECORD_TTL_SECS`. Unlike `delete_unreferenced_content`,
+    /// this needs no cross-referencing pass - each record's own embedded
+    /// timestamp (via `ContentIndex`, the same encoding used for content
+    /// freshness tracking) is independently sufficient to decide
+    /// eligibility, so this is a single scan-and-delete sweep.
+    pub async fn sweep_idempotency_records(
+        self: Arc<Self>,
+        dry_run: bool,
+        ns_id: [u8; 10],
+        now: Duration,
+        mut progress_callback: impl FnMut(Option<u64>),
+    ) -> Result<()> {
+        let ttl = Duration::from_secs(IDEMPOTENCY_RECORD_TTL_SECS.load(Ordering::Relaxed));
+        let scan_start = self
+            .key_codec
+            .construct_idempotency_record_key(ns_id, [0u8; 16]);
+        let scan_end = self
+            .key_codec
+            .construct_idempotency_record_key(ns_id, [0xffu8; 16]);
+
+        let mut lock = DistributedLock::new(
+            self.key_codec
+                .construct_nstask_key(ns_id, "sweep_idempotency_records"),
+            "sweep_idempotency_records".into(),
+        );
+        let me = self.clone();
+        let locked = lock
+            .lock(
+                move || {
+                    me.db
+                        .create_trx()
+                        .with_context(|| "transaction creation failed")
+                },
+                Duration::from_secs(5),
+            )
+            .await?;
+        if !locked {
+            anyhow::bail!("failed to acquire lock");
+        }
+
+        let mut deletion_set: Vec<Vec<u8>> = vec![];
+        self.scan_range_simple(&lock, scan_start, scan_end, |kv| {
+            if let Ok(entry) = ContentIndex::decode(kv.value()) {
+                if now.saturating_sub(entry.time) >= ttl {
+                    deletion_set.push(kv.key().to_vec());
+                }
+            }
+        })
+        .await?;
+
+        if !deletion_set.is_empty() && !dry_run {
+            for chunk in deletion_set.chunks(GC_SCAN_BATCH_SIZE.load(Ordering::Relaxed)) {
+                loop {
+                    let txn = lock.create_txn_and_check_sync(&self.db).await?;
+                    for item in chunk {
+                        txn.clear(item);
+                    }
+                    match txn.commit().await {
+                        Ok(_) => break,
+                        Err(e) => {
+                            e.on_error().await?;
+                        }
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            ns = hex::encode(&ns_id),
+            count = deletion_set.len(),
+            dry = dry_run,
+            "swept idempotency records"
+        );
+        progress_callback(Some(deletion_set.len() as u64));
+        progress_callback(None);
+        Ok(())
+    }
     pub async fn truncate_versions(
         self: Arc<Self>,
         dry_run: bool,
@@ -37,14 +127,15 @@ impl Server {
         // - The cluster's current read version as seen by this snapshot
         // - The NS lock version in the same snapshot
         {
-            let txn = self.core.db.create_trx()?;
+            let txn = self.db.create_trx()?;
 
             before_version = before_version.min(get_txn_read_version_as_versionstamp(&txn).await?);
 
             let metadata = self
-                .core.ns_metadata_cache
-                .get(&txn, &self.core.key_codec, ns_id)
-                .await?;
+                .ns_metadata_cache
+                .get(&txn, &self.key_codec, ns_id)
+                .await
+                .map_err(|e| *e)?;
             if let Some(lock) = &metadata.lock {
                 before_version = before_version.min(decode_version(&lock.snapshot_version)?);
             }
@@ -55,13 +146,13 @@ impl Server {
             before_version = hex::encode(&before_version),
             "starting version truncation"
         );
-        let scan_start = self.core.key_codec.construct_page_key(ns_id, 0, [0u8; 10]);
+        let scan_start = self.key_codec.construct_page_key(ns_id, 0, [0u8; 10]);
         let scan_end = self
-            .core.key_codec
+            .key_codec
             .construct_page_key(ns_id, std::u32::MAX, [0xffu8; 10]);
         let mut scan_cursor = scan_start.clone();
         let mut lock = DistributedLock::new(
-            self.core.key_codec
+            self.key_codec
                 .construct_nstask_key(ns_id, "truncate_versions"),
             "truncate_versions".into(),
         );
@@ -70,7 +161,7 @@ impl Server {
         let locked = lock
             .lock(
                 move || {
-                    me.core.db
+                    me.db
                         .create_trx()
                         .with_context(|| "transaction creation failed")
                 },
@@ -85,7 +176,7 @@ impl Server {
 
         loop {
             let scan_result = loop {
-                let txn = lock.create_txn_and_check_sync(&self.core.db).await?;
+                let txn = lock.create_txn_and_check_sync(&self.db).await?;
                 let range: Vec<_> = match txn
                     .get_ranges_keyvalues(
                         RangeOption {
@@ -142,7 +233,7 @@ impl Server {
             if !deletion_set.is_empty() {
                 if !dry_run {
                     loop {
-                        let txn = lock.create_txn_and_check_sync(&self.core.db).await?;
+                        let txn = lock.create_txn_and_check_sync(&self.db).await?;
                         for item in &deletion_set {
                             txn.clear(item);
                         }
@@ -167,10 +258,10 @@ impl Server {
 
         // Delete changelog
         loop {
-            let txn = lock.create_txn_and_check_sync(&self.core.db).await?;
-            let start = self.core.key_codec.construct_changelog_key(ns_id, [0u8; 10]);
+            let txn = lock.create_txn_and_check_sync(&self.db).await?;
+            let start = self.key_codec.construct_changelog_key(ns_id, [0u8; 10]);
             let end = self
-                .core.key_codec
+                .key_codec
                 .construct_changelog_key(ns_id, before_version);
             // End is exclusive - `before_version` itself should not be deleted
             txn.clear_range(start.as_slice(), end.as_slice());
@@ -197,7 +288,7 @@ impl Server {
 
         loop {
             let scan_result = loop {
-                let txn = lock.create_txn_and_check_sync(&self.core.db).await?;
+                let txn = lock.create_txn_and_check_sync(&self.db).await?;
                 let range: Vec<_> = match txn
                     .get_ranges_keyvalues(
                         RangeOption {
@@ -241,9 +332,9 @@ impl Server {
         ns_id: [u8; 10],
         mut cb: impl FnMut([u8; 32]),
     ) -> Result<()> {
-        let scan_start = self.core.key_codec.construct_page_key(ns_id, 0, [0u8; 10]);
+        let scan_start = self.key_codec.construct_page_key(ns_id, 0, [0u8; 10]);
         let scan_end = self
-            .core.key_codec
+            .key_codec
             .construct_page_key(ns_id, std::u32::MAX, [0xffu8; 10]);
         self.scan_range_simple(lock, scan_start, scan_end, |kv| {
             if let Ok(x) = <[u8; 32]>::try_from(kv.value()) {
@@ -260,10 +351,10 @@ impl Server {
         mut cb: impl FnMut([u8; 32]),
     ) -> Result<()> {
         let scan_start = self
-            .core.key_codec
+            .key_codec
             .construct_delta_referrer_key(ns_id, [0u8; 32]);
         let scan_end = self
-            .core.key_codec
+            .key_codec
             .construct_delta_referrer_key(ns_id, [0xffu8; 32]);
         self.scan_range_simple(lock, scan_start, scan_end, |kv| {
             if let Ok(x) = <[u8; 32]>::try_from(kv.value()) {
@@ -280,9 +371,9 @@ impl Server {
         mut progress_callback: impl FnMut(String),
     ) -> Result<()> {
         let ns_id_hex = hex::encode(&ns_id);
-        let commit_token_key = self.core.key_codec.construct_ns_commit_token_key(ns_id);
+        let commit_token_key = self.key_codec.construct_ns_commit_token_key(ns_id);
         let mut lock = DistributedLock::new(
-            self.core.key_codec
+            self.key_codec
                 .construct_nstask_key(ns_id, "delete_unreferenced_content"),
             "delete_unreferenced_content".into(),
         );
@@ -290,7 +381,7 @@ impl Server {
         let locked = lock
             .lock(
                 move || {
-                    me.core.db
+                    me.db
                         .create_trx()
                         .with_context(|| "transaction creation failed")
                 },
@@ -302,7 +393,7 @@ impl Server {
         }
 
         // Step 1: Fetch read version RAW-RV.
-        let read_version = self.core.db.create_trx()?.get_read_version().await?;
+        let read_version = self.db.create_trx()?.get_read_version().await?;
 
         // Step 2: Collect inconsistent snapshot of hashes.
         // 2a. Scan the page index incrementally and collect all hashes.
@@ -337,16 +428,16 @@ impl Server {
 
         // Step 3: scan the content index
         {
-            let scan_start = self.core.key_codec.construct_contentindex_key(ns_id, [0u8; 32]);
+            let scan_start = self.key_codec.construct_contentindex_key(ns_id, [0u8; 32]);
             let scan_end = self
-                .core.key_codec
+                .key_codec
                 .construct_contentindex_key(ns_id, [0xffu8; 32]);
             let mut scan_cursor = scan_start.clone();
             let prefix_len = scan_start.len() - 32;
             let mut count = 0usize;
             loop {
                 // Step 3, TXN1
-                let mut txn = lock.create_txn_and_check_sync(&self.core.db).await?;
+                let mut txn = lock.create_txn_and_check_sync(&self.db).await?;
                 let txn1_rv = match txn.get_read_version().await {
                     Ok(x) => x,
                     Err(e) => {
@@ -431,10 +522,10 @@ impl Server {
                 txn.set_read_version(txn1_rv);
 
                 for hash in &delete_queue {
-                    let ci_key = self.core.key_codec.construct_contentindex_key(ns_id, *hash);
-                    let content_key = self.core.key_codec.construct_content_key(ns_id, *hash);
+                    let ci_key = self.key_codec.construct_contentindex_key(ns_id, *hash);
+                    let content_key = self.key_codec.construct_content_key(ns_id, *hash);
                     let delta_referrer_key =
-                        self.core.key_codec.construct_delta_referrer_key(ns_id, *hash);
+                        self.key_codec.construct_delta_referrer_key(ns_id, *hash);
 
                     // 3e. Add the CAM index of the remaining pages to the conflict set.
                     add_single_key_read_conflict_range(&txn, &ci_key)?;

@@ -68,6 +68,31 @@ impl KeyCodec {
         buf
     }
 
+    /// A durable, per-(namespace, idempotency_key) record - deliberately a
+    /// *different* key from `construct_last_write_version_key`, not an
+    /// overload of it. The LWV key is a single mutable "whoever committed
+    /// most recently" pointer, shared by every transaction in the
+    /// namespace; any concurrent commit between an ambiguous attempt and
+    /// its retry silently overwrites it, so checking it for "did MY attempt
+    /// already commit" is a race, not a fix, under concurrent load. This
+    /// key is unique per idempotency_key (a fresh random 128 bits per
+    /// logical commit attempt), so no other transaction's commit can ever
+    /// touch it - a point lookup here answers "did this exact attempt
+    /// commit" unconditionally, not "as of the last time nobody else wrote
+    /// here."
+    pub fn construct_idempotency_record_key(
+        &self,
+        ns_id: [u8; 10],
+        idempotency_key: [u8; 16],
+    ) -> FixedKeyVec {
+        let mut buf = FixedKeyVec::new();
+        buf.extend_from_slice(&self.raw_data_prefix).unwrap();
+        buf.extend_from_slice(&ns_id).unwrap();
+        buf.push(b'i').unwrap();
+        buf.extend_from_slice(&idempotency_key).unwrap();
+        buf
+    }
+
     pub fn construct_ns_data_prefix(&self, ns_id: [u8; 10]) -> FixedKeyVec {
         let mut buf = FixedKeyVec::new();
         buf.extend_from_slice(&self.raw_data_prefix).unwrap();

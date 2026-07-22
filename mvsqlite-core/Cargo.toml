@@ -26,3 +26,5 @@ moka = { version = "0.9.4", features = ["future"] }
 constant_time_eq = "0.2.4"
 heapless = { version = "0.7", features = ["serde"] }
 itertools = "0.10.5"
+rmp-serde = "1.1.1"
+bloom = "0.3.2"

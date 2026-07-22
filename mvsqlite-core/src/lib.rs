@@ -1,11 +1,15 @@
+pub mod boot;
 pub mod commit;
 pub mod delta;
 pub mod fixed;
+pub mod gc;
 pub mod keys;
+pub mod lock;
 pub mod metadata;
 pub mod namespace;
 pub mod nslock;
 pub mod page;
+pub mod read;
 pub mod replica;
 pub mod stat;
 pub mod time2version;
@@ -21,6 +25,7 @@ use moka::future::Cache;
 
 use crate::{keys::KeyCodec, metadata::NamespaceMetadataCache, replica::ReplicaManager};
 
+#[derive(Clone)]
 pub struct CoreConfig {
     pub cluster: String,
     pub raw_data_prefix: String,

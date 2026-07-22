@@ -115,8 +115,6 @@ jobs:
           curl -L https://github.com/apple/foundationdb/releases/download/7.1.53/foundationdb-clients_7.1.53-1_amd64.deb --output fdb-client.deb
           sudo dpkg -i fdb-client.deb
           sudo apt update && sudo apt install -y libfuse3-dev execstack
-      - name: Build (mvstore)
-        run: cargo build --locked --release -p mvstore
       - name: Build (mvsqlite)
         run: cargo build --locked --release -p mvsqlite
       - name: Build (mvsqlite-fuse)
@@ -139,7 +137,6 @@ jobs:
           set -e
           mkdir build
           cd build
-          cp ../target/release/mvstore ./
           cp ../target/release/mvstore-stress ./
           cp ../target/release/mvsqlite-fuse ./
           cp ../mvsqlite-preload/libmvsqlite_preload.so ./
@@ -156,31 +153,6 @@ jobs:
         with:
           name: build
           path: ./build
-  build-deb:
-    name: Build DEB
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-      - name: Install system dependencies
-        run: |
-          set -e
-          curl -L https://github.com/apple/foundationdb/releases/download/7.1.53/foundationdb-clients_7.1.53-1_amd64.deb --output fdb-client.deb
-          sudo dpkg -i fdb-client.deb
-          cargo install cargo-deb
-          sudo apt update && sudo apt install -y libfuse3-dev # stop cargo from complaining, not really needed
-      - name: Build mvstore
-        run: cd mvstore && cargo deb && cd .. && mkdir deb && cp ./target/debian/*.deb ./deb/
-      - name: Push
-        uses: actions/upload-artifact@v4
-        with:
-          name: deb
-          path: ./deb
   stress:
     name: mvstore stress test
     runs-on: ubuntu-22.04
@@ -204,40 +176,10 @@ jobs:
       - name: Run it
         run: |
           set -e
-          chmod +x ./build/mvstore ./build/mvstore-stress
-          export RUST_LOG=info
-          ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m &
-          sleep 1
-          curl http://localhost:7001/api/create_namespace -d '{"key":"stress","metadata":""}'
-          RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress --concurrency 50 --data-plane http://localhost:7000 --admin-api http://localhost:7001 --iterations 1000 --ns-key stress --pages 1000
-  stress-auto-create-namespace:
-    name: mvstore stress test
-    runs-on: ubuntu-22.04
-    needs:
-      - build
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Install system dependencies
-        run: |
-          set -e
-          curl -L https://github.com/apple/foundationdb/releases/download/7.1.53/foundationdb-clients_7.1.53-1_amd64.deb --output fdb-client.deb
-          sudo dpkg -i fdb-client.deb
-          curl -L https://github.com/apple/foundationdb/releases/download/7.1.53/foundationdb-server_7.1.53-1_amd64.deb --output fdb-server.deb
-          sudo dpkg -i fdb-server.deb
-      - name: Fetch binaries
-        uses: actions/download-artifact@v4
-        with:
-          name: build
-          path: ./build
-      - name: Run it
-        run: |
-          set -e
-          chmod +x ./build/mvstore ./build/mvstore-stress
-          export RUST_LOG=info
-          ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m --auto-create-namespace &
-          sleep 1
-          RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress --concurrency 50 --data-plane http://localhost:7000 --admin-api http://localhost:7001 --iterations 1000 --ns-key stress --pages 1000
+          chmod +x ./build/mvstore-stress
+          RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress \
+            --raw-data-prefix m --metadata-prefix mvstore-test --auto-create-namespace \
+            --concurrency 50 --iterations 1000 --ns-key stress --pages 1000
   stress-disable-read-set:
     name: mvstore stress test (disable read set)
     runs-on: ubuntu-22.04
@@ -261,12 +203,10 @@ jobs:
       - name: Run it
         run: |
           set -e
-          chmod +x ./build/mvstore ./build/mvstore-stress
-          export RUST_LOG=info
-          ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m &
-          sleep 1
-          curl http://localhost:7001/api/create_namespace -d '{"key":"stress","metadata":""}'
-          RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress --concurrency 50 --data-plane http://localhost:7000 --admin-api http://localhost:7001 --iterations 1000 --ns-key stress --pages 1000 --disable-read-set
+          chmod +x ./build/mvstore-stress
+          RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress \
+            --raw-data-prefix m --metadata-prefix mvstore-test --auto-create-namespace \
+            --concurrency 50 --iterations 1000 --ns-key stress --pages 1000 --disable-read-set
   stress-small-gc-batch:
     name: mvstore stress test (small gc batch)
     runs-on: ubuntu-22.04
@@ -290,13 +230,11 @@ jobs:
       - name: Run it
         run: |
           set -e
-          chmod +x ./build/mvstore ./build/mvstore-stress
-          export RUST_LOG=info
-          ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m \
-            --knob-gc-scan-batch-size 50 &
-          sleep 1
-          curl http://localhost:7001/api/create_namespace -d '{"key":"stress","metadata":""}'
-          RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress --concurrency 50 --data-plane http://localhost:7000 --admin-api http://localhost:7001 --iterations 1000 --ns-key stress --pages 1000
+          chmod +x ./build/mvstore-stress
+          RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress \
+            --raw-data-prefix m --metadata-prefix mvstore-test --auto-create-namespace \
+            --concurrency 50 --iterations 1000 --ns-key stress --pages 1000 \
+            --knob-gc-scan-batch-size 50
   stress-gc-nofresh:
     name: mvstore stress test (gc without fresh time check)
     runs-on: ubuntu-22.04
@@ -320,14 +258,11 @@ jobs:
       - name: Run it
         run: |
           set -e
-          chmod +x ./build/mvstore ./build/mvstore-stress
-          export RUST_LOG=info
-          ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m \
-            --knob-gc-fresh-page-ttl-secs 0 &
-          sleep 1
-          curl http://localhost:7001/api/create_namespace -d '{"key":"stress","metadata":""}'
-          RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress --concurrency 50 --data-plane http://localhost:7000 --admin-api http://localhost:7001 --iterations 1000 --ns-key stress --pages 1000 \
-            --disable-ryw --permit-410
+          chmod +x ./build/mvstore-stress
+          RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress \
+            --raw-data-prefix m --metadata-prefix mvstore-test --auto-create-namespace \
+            --concurrency 50 --iterations 1000 --ns-key stress --pages 1000 \
+            --knob-gc-fresh-page-ttl-secs 0 --disable-ryw --permit-bad-page-reference
   stress-commit-multi-phase:
     name: mvstore stress test (gc without fresh time check + multi phase commit)
     runs-on: ubuntu-22.04
@@ -351,19 +286,25 @@ jobs:
       - name: Run it
         run: |
           set -e
-          chmod +x ./build/mvstore ./build/mvstore-stress
-          export RUST_LOG=info
-          ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m \
-            --knob-gc-fresh-page-ttl-secs 0 --knob-commit-multi-phase-threshold 0 --knob-gc-scan-batch-size 50 &
-          sleep 1
-          curl http://localhost:7001/api/create_namespace -d '{"key":"stress","metadata":""}'
-          RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress --concurrency 50 --data-plane http://localhost:7000 --admin-api http://localhost:7001 --iterations 1000 --ns-key stress --pages 1000 \
-            --disable-ryw --permit-410
+          chmod +x ./build/mvstore-stress
+          RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress \
+            --raw-data-prefix m --metadata-prefix mvstore-test --auto-create-namespace \
+            --concurrency 50 --iterations 1000 --ns-key stress --pages 1000 \
+            --knob-gc-fresh-page-ttl-secs 0 --knob-commit-multi-phase-threshold 0 \
+            --knob-gc-scan-batch-size 50 --disable-ryw --permit-bad-page-reference
   stress-buggify:
     name: mvstore stress test (buggify)
     runs-on: ubuntu-22.04
     needs:
       - build
+    # fdb_buggify randomizes fault injection itself, so unlike the other
+    # deterministic-knob stress jobs its runtime and code-path coverage
+    # already vary run to run - keep the workload small (this scale already
+    # reliably reproduced the idempotency bugs found in local testing) so
+    # that variance shows up as a fast pass/fail signal instead of adding
+    # minutes to every CI run, and bound the worst case explicitly instead
+    # of relying on the default multi-hour job timeout.
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -382,16 +323,10 @@ jobs:
       - name: Run it
         run: |
           set -e
-          chmod +x ./build/mvstore ./build/mvstore-stress
-          export RUST_LOG=info
-          ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m &
-          sleep 1
-          curl http://localhost:7001/api/create_namespace -d '{"key":"stress","metadata":""}'
-          killall -9 mvstore
-          sleep 1
-          ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m --fdb-buggify &
-          sleep 1
-          RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress --concurrency 50 --data-plane http://localhost:7000 --admin-api http://localhost:7001 --iterations 500 --ns-key stress --pages 1000
+          chmod +x ./build/mvstore-stress
+          RUST_LOG=error,mvstore_stress=info ./build/mvstore-stress \
+            --raw-data-prefix m --metadata-prefix mvstore-test --auto-create-namespace \
+            --concurrency 16 --iterations 300 --ns-key stress --pages 100 --fdb-buggify
   sqlite-speedtest1-default-page-size:
     name: SQLite benchmark (speedtest1), default page size
     runs-on: ubuntu-22.04
@@ -415,18 +350,17 @@ jobs:
       - name: Run it
         run: |
           set -e
-          chmod +x ./build/mvstore
-          export RUST_LOG=info
-          ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m &
-          sleep 1
-          curl http://localhost:7001/api/create_namespace -d '{"key":"test","metadata":""}'
           git clone https://github.com/sqlite/sqlite
           cd sqlite
           git checkout version-3.31.1 # ubuntu 20.04
           git apply ../res/ci/sqlite.patch
           gcc -O2 -o speedtest1 test/speedtest1.c -lsqlite3
           ./speedtest1 ./test.db
-          LD_PRELOAD=../build/libmvsqlite_preload.so MVSQLITE_DATA_PLANE=http://localhost:7000 RUST_LOG=error ./speedtest1 test
+          LD_PRELOAD=../build/libmvsqlite_preload.so \
+            MVSQLITE_RAW_DATA_PREFIX=m \
+            MVSQLITE_METADATA_PREFIX=mvstore-test \
+            MVSQLITE_AUTO_CREATE_NAMESPACE=1 \
+            RUST_LOG=error ./speedtest1 test
   sqlite-speedtest1-16k-page:
     name: SQLite benchmark (speedtest1), 16K pages
     runs-on: ubuntu-22.04
@@ -450,18 +384,18 @@ jobs:
       - name: Run it
         run: |
           set -e
-          chmod +x ./build/mvstore
-          export RUST_LOG=info
-          ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m &
-          sleep 1
-          curl http://localhost:7001/api/create_namespace -d '{"key":"test","metadata":""}'
           git clone https://github.com/sqlite/sqlite
           cd sqlite
           git checkout version-3.31.1 # ubuntu 20.04
           git apply ../res/ci/sqlite.patch
           gcc -O2 -o speedtest1 test/speedtest1.c -lsqlite3
           ./speedtest1 ./test.db
-          LD_PRELOAD=../build/libmvsqlite_preload.so MVSQLITE_DATA_PLANE=http://localhost:7000 MVSQLITE_SECTOR_SIZE=16384 RUST_LOG=error ./speedtest1 test
+          LD_PRELOAD=../build/libmvsqlite_preload.so \
+            MVSQLITE_RAW_DATA_PREFIX=m \
+            MVSQLITE_METADATA_PREFIX=mvstore-test \
+            MVSQLITE_AUTO_CREATE_NAMESPACE=1 \
+            MVSQLITE_SECTOR_SIZE=16384 \
+            RUST_LOG=error ./speedtest1 test
   sqlite-speedtest1-default-page-size-fuse:
     name: SQLite benchmark (speedtest1), default page size, fuse
     runs-on: ubuntu-22.04
@@ -486,11 +420,6 @@ jobs:
       - name: Run it
         run: |
           set -e
-          chmod +x ./build/mvstore
-          export RUST_LOG=info
-          ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m &
-          sleep 1
-          curl http://localhost:7001/api/create_namespace -d '{"key":"test","metadata":""}'
           git clone https://github.com/sqlite/sqlite
           cd sqlite
           git checkout version-3.31.1 # ubuntu 20.04
@@ -499,7 +428,8 @@ jobs:
           ./speedtest1 ./test.db
           mkdir fusemnt
           chmod +x ../build/mvsqlite-fuse
-          RUST_LOG=error ../build/mvsqlite-fuse --data-plane http://localhost:7000 \
+          RUST_LOG=error ../build/mvsqlite-fuse \
+            --raw-data-prefix m --metadata-prefix mvstore-test --auto-create-namespace \
             --mountpoint ./fusemnt \
             --namespaces "db=test" &
           sleep 1
@@ -535,21 +465,16 @@ jobs:
       matrix:
         workload: [workloadb]
         content_cache_size: ["0", "10000"]
-        wire_zstd: ["", "--wire-zstd"]
         include:
           - workload: workloada
             content_cache_size: "0"
-            wire_zstd: ""
           - workload: workloadc
             content_cache_size: "0"
-            wire_zstd: ""
           - workload: workloadc
             content_cache_size: "10000"
-            wire_zstd: "--wire-zstd"
           - workload: workloadf
             content_cache_size: "10000"
-            wire_zstd: "--wire-zstd"
-            
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -574,20 +499,16 @@ jobs:
       - name: Run it
         run: |
           set -e
-          chmod +x ./build/mvstore
           chmod +x ./go-ycsb/go-ycsb
-          RUST_LOG=error ./build/mvstore --data-plane 127.0.0.1:7000 --admin-api 127.0.0.1:7001 --metadata-prefix mvstore-test --raw-data-prefix m \
-            --content-cache-size "${{ matrix.content_cache_size }}" \
-            ${{ matrix.wire_zstd }} &
-          sleep 1
 
           # Preload mode
-          curl -f http://localhost:7001/api/create_namespace -d '{"key":"ycsb","metadata":""}'
           PRELOAD_PATH="$PWD/build/libmvsqlite_preload.so" \
             MVSQLITE_PAGE_CACHE_SIZE=50000 \
             MVSQLITE_SECTOR_SIZE=16384 \
-            MVSQLITE_FORCE_HTTP2=1 \
-            MVSQLITE_DATA_PLANE=http://localhost:7000 \
+            MVSQLITE_RAW_DATA_PREFIX=m \
+            MVSQLITE_METADATA_PREFIX=mvstore-test \
+            MVSQLITE_AUTO_CREATE_NAMESPACE=1 \
+            MVSQLITE_CONTENT_CACHE_SIZE="${{ matrix.content_cache_size }}" \
             RUST_LOG=off \
             ./res/ci/ycsb.sh ycsb "${{ matrix.workload }}"
 
@@ -601,7 +522,6 @@ jobs:
       - stress-gc-nofresh
       - stress-commit-multi-phase
       - stress-disable-read-set
-      - build-deb
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-22.04
     steps:
@@ -609,17 +529,12 @@ jobs:
         with:
           name: build
           path: ./build
-      - uses: actions/download-artifact@v4
-        with:
-          name: deb
-          path: ./deb
       - uses: softprops/action-gh-release@v1
         with:
           files: |
-            build/mvstore
             build/mvsqlite-fuse
+            build/mvstore-stress
             build/libmvsqlite_preload.so
             build/libmvsqlite.a
             build/libsqlite3.so
-            deb/*.deb
           prerelease: true

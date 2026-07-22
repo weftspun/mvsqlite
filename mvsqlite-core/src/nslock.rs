@@ -63,7 +63,7 @@ pub async fn acquire_nslock(
 
     let mut txn = db.create_trx()?;
     loop {
-        let metadata = ns_metadata_cache.get(&txn, key_codec, ns_id).await?;
+        let metadata = ns_metadata_cache.get(&txn, key_codec, ns_id).await.map_err(|e| *e)?;
         let mut metadata = (*metadata).clone();
 
         // Is this lock already held?
@@ -121,7 +121,7 @@ pub async fn release_nslock(
     let snapshot_version: [u8; 10];
 
     loop {
-        let metadata = ns_metadata_cache.get(&txn, key_codec, ns_id).await?;
+        let metadata = ns_metadata_cache.get(&txn, key_codec, ns_id).await.map_err(|e| *e)?;
         let mut metadata = (*metadata).clone();
 
         if metadata.lock.is_none() {
@@ -271,7 +271,7 @@ pub async fn release_nslock(
         }
 
         // Unlock
-        let metadata = ns_metadata_cache.get(&txn, key_codec, ns_id).await?;
+        let metadata = ns_metadata_cache.get(&txn, key_codec, ns_id).await.map_err(|e| *e)?;
         let mut metadata = (*metadata).clone();
         metadata.lock = None;
         ns_metadata_cache.set(&txn, key_codec, ns_id, Arc::new(metadata))?;
@@ -294,7 +294,7 @@ async fn lock_is_still_valid(
     ns_id: [u8; 10],
     nonce: &str,
 ) -> Result<bool> {
-    let metadata = ns_metadata_cache.get(&txn, key_codec, ns_id).await?;
+    let metadata = ns_metadata_cache.get(&txn, key_codec, ns_id).await.map_err(|e| *e)?;
     if let Some(lock) = &metadata.lock {
         if lock.nonce == nonce {
             return Ok(true);

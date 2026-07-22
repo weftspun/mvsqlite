@@ -19,21 +19,13 @@ wget https://github.com/apple/foundationdb/releases/download/7.1.15/foundationdb
 sudo dpkg -i foundationdb-server_7.1.15-1_amd64.deb
 ```
 
-2. Build, run `mvstore`, create a namespace with the admin API, build `libsqlite3` and the `sqlite3` CLI, set environment variables, and run the shell. Detailed instructions can be found in the [wiki](https://github.com/V-Sekai/mvsqlite/wiki).
+2. mvSQLite's SQLite VFS talks to FoundationDB directly - there's no server process to run. Set the environment variables that tell it where to find the cluster and which namespace to use, then build `libsqlite3` and the `sqlite3` CLI. Detailed instructions can be found in the [wiki](https://github.com/V-Sekai/mvsqlite/wiki).
 
 ```bash
-cargo build --release -p mvstore
-RUST_LOG=info ./mvstore \
-  --data-plane 127.0.0.1:7000 \
-  --admin-api 127.0.0.1:7001 \
-  --metadata-prefix mvstore \
-  --raw-data-prefix m
-```
-
-Create a namespace with the admin API:
-
-```bash
-curl http://localhost:7001/api/create_namespace -i -d '{"key":"test"}'
+export MVSQLITE_FDB_CLUSTER=/etc/foundationdb/fdb.cluster
+export MVSQLITE_METADATA_PREFIX=mvsqlite
+export MVSQLITE_RAW_DATA_PREFIX=m
+export MVSQLITE_AUTO_CREATE_NAMESPACE=1
 ```
 
 3. To run `sqlite3`. Build `libsqlite3` and the `sqlite3` CLI: (note that a custom build is only needed here because the `sqlite3` binary shipped on most systems are statically linked to `libsqlite3` and `LD_PRELOAD` don't work)

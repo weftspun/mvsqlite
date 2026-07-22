@@ -57,6 +57,28 @@ impl ContentIndex {
 #[error("gone: {0}")]
 pub struct GoneError(pub &'static str);
 
+/// Wraps the `Arc<anyhow::Error>` that `moka`'s `try_get_with` returns on
+/// error, preserving it as a proper `source()` instead of losing its type
+/// via string interpolation (`anyhow!("...: {}", e)`). That distinction
+/// matters: something further up the call chain - notably
+/// `mvclient::is_retryable`'s search for a `FdbError` anywhere in the
+/// chain - needs the original error type to still be reachable, not just
+/// its formatted message.
+#[derive(Debug)]
+pub struct CacheError(pub std::sync::Arc<anyhow::Error>);
+
+impl std::fmt::Display for CacheError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for CacheError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&**self.0)
+    }
+}
+
 pub fn add_single_key_read_conflict_range(txn: &Transaction, key: &[u8]) -> Result<(), FdbError> {
     txn.add_conflict_range(
         key,

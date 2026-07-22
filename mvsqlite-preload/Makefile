@@ -12,7 +12,7 @@ build-preload: preload.o shim.o
 	$(CC) $(CFLAGS) -shared $(LDFLAGS) \
 		-o libmvsqlite_preload.so \
 		preload.o shim.o \
-		-L../target/release -lmvsqlite -lsqlite3 -lpthread -ldl -lm
+		-L../target/release -lmvsqlite -lsqlite3 -lfdb_c -lpthread -ldl -lm
 
 build-lib: shim.o
 	ar rcs libmvsqlite.a shim.o
@@ -28,7 +28,7 @@ build-patched-sqlite3:
 		-DSQLITE_ENABLE_COLUMN_METADATA \
 		-DMV_STATIC_PATCH \
 		./sqlite3.c ./preload.c ./shim.c \
-			-L../target/release -lmvsqlite -lpthread -ldl -lm
+			-L../target/release -lmvsqlite -lfdb_c -lpthread -ldl -lm
 
 clean:
 	rm -f libmvsqlite_preload.so preload.o shim.o
