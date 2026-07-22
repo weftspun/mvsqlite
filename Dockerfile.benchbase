@@ -1,0 +1,14 @@
+FROM docker.io/library/rust:1-bookworm
+WORKDIR /src
+RUN apt-get update && apt-get install -y \
+    clang libclang-dev \
+    libsqlite3-dev build-essential git curl unzip maven \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -L https://github.com/apple/foundationdb/releases/download/7.1.53/foundationdb-clients_7.1.53-1_amd64.deb -o fdb-client.deb \
+    && dpkg -i fdb-client.deb && rm -f fdb-client.deb
+RUN curl -sL "https://api.adoptium.net/v3/binary/latest/23/ga/linux/x64/jdk/hotspot/normal/eclipse" -o jdk.tar.gz \
+    && mkdir -p /usr/lib/jvm/temurin-23 \
+    && tar -C /usr/lib/jvm/temurin-23 --strip-components=1 -xzf jdk.tar.gz \
+    && rm -f jdk.tar.gz
+ENV JAVA_HOME="/usr/lib/jvm/temurin-23"
+ENV PATH="${JAVA_HOME}/bin:${PATH}"

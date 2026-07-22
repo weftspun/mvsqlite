@@ -1,0 +1,6 @@
+# Force LF for shell scripts regardless of the checking-out platform's
+# core.autocrlf setting. Windows' autocrlf=true silently corrupts shebang
+# lines in vendored shell scripts (e.g.
+# third_party/sqlite-jdbc/amalgamation_version.sh) into
+# "#!/usr/bin/env bash\r", which then fails to find a binary named "bash\r".
+*.sh text eol=lf
